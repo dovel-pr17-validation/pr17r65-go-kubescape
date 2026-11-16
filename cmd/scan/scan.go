@@ -1,0 +1,740 @@
+package scan
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/anchore/grype/grype/vulnerability"
+	"github.com/kubescape/kubescape/v4/cmd/shared"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/cautils/getter"
+	"github.com/kubescape/kubescape/v4/core/core"
+	"github.com/kubescape/kubescape/v4/core/meta"
+	"github.com/kubescape/kubescape/v4/core/pkg/reportcrypto"
+	"github.com/kubescape/kubescape/v4/core/pkg/resultshandling"
+	resultsdiff "github.com/kubescape/kubescape/v4/core/pkg/resultshandling/diff"
+	contractv1alpha1 "github.com/kubescape/kubescape/v4/core/pkg/scancontract/v1alpha1"
+	"github.com/kubescape/kubescape/v4/core/pkg/telemetry"
+	"github.com/kubescape/kubescape/v4/pkg/imagescan"
+	v1 "github.com/kubescape/opa-utils/httpserver/apis/v1"
+	"github.com/spf13/cobra"
+)
+
+var scanCmdExamples = fmt.Sprintf(`
+  Scan command is for scanning an existing cluster or kubernetes manifest files based on pre-defined frameworks
+
+  # Scan current cluster
+  %[1]s scan
+
+  # Scan kubernetes manifest files
+  %[1]s scan .
+
+  # Scan manifest files, leaving test fixtures and generated output out of the scan
+  %[1]s scan . --exclude-path 'test/**' --exclude-path '*.generated.yaml'
+
+  # Scan kubernetes manifest files again whenever they change
+  %[1]s scan ./manifests --watch
+
+  # Scan and save the results in the JSON format
+  %[1]s scan --format json --output results.json
+
+  # Scan and save the results in multiple format in a single scan
+  %[1]s scan --format json,html,junit --output result
+
+  # Display all resources
+  %[1]s scan --verbose
+
+  # Generate an anonymized report
+  %[1]s scan --hide --format json -o report.json
+
+  # The key is a passphrase of at least 16 characters. It is stretched into an
+  # AES-256 key with Argon2id under a per-report salt, so length is what buys
+  # you security here — prefer a long passphrase or generated key material.
+  export KUBESCAPE_MASTER_KEY="$(openssl rand -base64 32)"
+  # Hex-encoded key material works too, via a separate variable:
+  # export KUBESCAPE_MASTER_KEY_HEX="$(openssl rand -hex 32)"
+  %[1]s scan --encrypt --format json -o encrypted-report.json
+
+  # Decrypt an encrypted report
+  %[1]s decrypt encrypted-report.json > decrypted-report.json
+
+  # Scan different clusters from the kubectl context
+  %[1]s scan --kube-context <kubernetes context>
+
+  # Compare a live scan against a saved baseline report and fail CI on new high-severity+ drift
+  %[1]s scan --baseline base.json --baseline-fail-on-new --baseline-severity-threshold high
+
+  # Export scan traces and metrics to an OpenTelemetry collector
+  %[1]s scan --otel-endpoint localhost:4317
+`, cautils.ExecName())
+
+func GetScanCommand(ks meta.IKubescape) *cobra.Command {
+	var scanInfo cautils.ScanInfo
+	var scanContractPath string
+	var scanContractName string
+	var scanContractAllow []string
+	var fleetConfigPath string
+	var watchMode bool
+	var selectedContract *contractv1alpha1.SelectedContract
+	var gitCloneDepth = cautils.DefaultGitCloneDepth
+	scanInfo.GitCloneDepth = &gitCloneDepth
+
+	// scanCmd represents the scan command
+	scanCmd := &cobra.Command{
+		Use:     "scan",
+		Short:   "Scan a Kubernetes cluster or YAML files for image vulnerabilities and misconfigurations",
+		Long:    `Scan a Kubernetes cluster, YAML files, Helm charts, Kustomize directories, Git repositories, or container images for security misconfigurations and vulnerabilities.`,
+		Example: scanCmdExamples,
+		Args:    cobra.ArbitraryArgs,
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			if cmd.Name() == "validate-contract" {
+				return nil
+			}
+			if cmd.Name() == "image" && scanContractPath != "" {
+				return fmt.Errorf("--scan-contract is supported for posture scans, not image scans")
+			}
+			var err error
+			selectedContract, err = loadAndApplyScanContract(cmd, &scanInfo, scanContractPath, scanContractName, scanContractAllow)
+			if err != nil {
+				return err
+			}
+			fleetInvocation = fleetCommandLine{cmd: cmd, args: args}
+			if err := applyFleetConfig(cmd, &scanInfo, fleetConfigPath); err != nil {
+				return err
+			}
+			// runs for the bare scan command and all subcommands (framework, control, workload, image)
+			if scanInfo.FormatVersion != "v1" && scanInfo.FormatVersion != "v2" {
+				return fmt.Errorf("invalid --format-version %q: supported versions are v1 and v2", scanInfo.FormatVersion)
+			}
+			if scanInfo.ScanTimeout < 0 {
+				return fmt.Errorf("invalid --scan-timeout %s: must be zero or positive", scanInfo.ScanTimeout)
+			}
+			if scanInfo.ControlTimeout < 0 {
+				return fmt.Errorf("invalid --control-timeout %s: must be zero or positive", scanInfo.ControlTimeout)
+			}
+			if gitCloneDepth < 0 {
+				return fmt.Errorf("invalid --git-clone-depth %d: must be zero or positive", gitCloneDepth)
+			}
+			scanInfo.GitCloneDepth = &gitCloneDepth
+			if cmd != nil && cmd.Name() != "image" {
+				if err := validateControlTimeout(&scanInfo); err != nil {
+					return err
+				}
+			}
+			if err := cautils.ValidateHelmKubeVersion(scanInfo.HelmKubeVersion); err != nil {
+				return fmt.Errorf("invalid --kube-version: %w", err)
+			}
+			if strings.TrimSpace(scanInfo.IncludeNamespaces) != "" && strings.TrimSpace(scanInfo.ExcludedNamespaces) != "" {
+				return fmt.Errorf("invalid arguments: --include-namespaces and --exclude-namespaces cannot be used together")
+			}
+			if strings.Contains(scanInfo.ControlsVersion, "/") {
+				return fmt.Errorf(
+					"invalid --controls-version %q: must be a regolibrary release tag and cannot contain '/'",
+					scanInfo.ControlsVersion,
+				)
+			}
+			if err := validateBaselineFlags(cmd, &scanInfo); err != nil {
+				return err
+			}
+			if err := validateKubeContextsSupported(cmd, &scanInfo); err != nil {
+				return err
+			}
+			if cmd.Flags().Changed("whole-cluster-policy") {
+				raw := strings.TrimSpace(string(scanInfo.WholeClusterPolicy))
+				if raw == "" {
+					return cautils.ValidateWholeClusterPolicy(scanInfo.WholeClusterPolicy)
+				}
+				resolved, err := cautils.ResolveWholeClusterPolicy(raw)
+				if err != nil {
+					return err
+				}
+				scanInfo.WholeClusterPolicy = resolved
+			} else {
+				resolved, err := cautils.ResolveWholeClusterPolicy("")
+				if err != nil {
+					return err
+				}
+				scanInfo.WholeClusterPolicy = resolved
+			}
+			captureKubeconfigSelection(cmd, &scanInfo)
+			applyRegistryCredentialsFromEnv(cmd, &scanInfo)
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if ks == nil {
+				return errors.New("uninitialized kubescape interface")
+			}
+
+			if watchMode {
+				if err := validateWatchFlags(cmd, &scanInfo, args); err != nil {
+					return err
+				}
+			}
+			if err := shared.ValidateCommonScanFlags(cmd, &scanInfo, shared.ScanFormats); err != nil {
+				return err
+			}
+			if err := validateCombinedImageScanFlags(&scanInfo); err != nil {
+				return err
+			}
+
+			if scanInfo.EncryptionEnabled {
+
+				if _, err := reportcrypto.GetMasterKeyFromEnv("encryption"); err != nil {
+					return err
+				}
+			}
+
+			requestedView := scanInfo.View
+
+			if err := validateFrameworkScanInfo(&scanInfo); err != nil {
+				return err
+			}
+
+			scanInfo.View = requestedView
+
+			if policyIdentifiers := contractPolicyIdentifiers(selectedContract); len(policyIdentifiers) > 0 {
+				cleanup, err := prepareScanLocalInput(cmd.InOrStdin(), args, &scanInfo, scanLocalInputOptions{
+					FirstInputArg:    0,
+					FilePath:         scanInfo.FilePath,
+					RejectMixedStdin: true,
+				})
+				if err != nil {
+					return err
+				}
+				defer cleanup()
+
+				setContractScanTarget(args, &scanInfo)
+				if len(scanInfo.KubeContexts) > 0 {
+					if _, err := validateFleetScanInvocation(&scanInfo); err != nil {
+						return err
+					}
+				}
+				// The invocation is valid from this point on. Runtime and result-gate
+				// failures should not print command usage.
+				cmd.SilenceUsage = true
+				if watchMode {
+					return watchSecurityScan(cmd, ks, &scanInfo, policyIdentifiers)
+				}
+				return securityScan(scanInfo, ks, policyIdentifiers)
+			}
+
+			if scanInfo.View == string(cautils.SecurityViewType) {
+				cleanup, err := prepareScanLocalInput(cmd.InOrStdin(), args, &scanInfo, scanLocalInputOptions{
+					FirstInputArg:    0,
+					FilePath:         scanInfo.FilePath,
+					RejectMixedStdin: true,
+				})
+				if err != nil {
+					return err
+				}
+				defer cleanup()
+
+				policyIdentifiers := setSecurityViewScanInfo(args, &scanInfo)
+				if len(scanInfo.KubeContexts) > 0 {
+					if _, err := validateFleetScanInvocation(&scanInfo); err != nil {
+						return err
+					}
+				}
+				// The invocation is valid from this point on. Runtime and result-gate
+				// failures should not print command usage.
+				cmd.SilenceUsage = true
+
+				if watchMode {
+					return watchSecurityScan(cmd, ks, &scanInfo, policyIdentifiers)
+				}
+				if err := securityScan(scanInfo, ks, policyIdentifiers); err != nil {
+					return err
+				}
+			} else {
+				filePath := scanInfo.FilePath
+				frameworkCmd := getFrameworkCmd(
+					ks,
+					&scanInfo,
+				)
+				scanInfo.FilePath = filePath
+				if err := frameworkCmd.RunE(
+					cmd,
+					append(
+						[]string{
+							strings.Join(
+								getter.NativeFrameworks,
+								",",
+							),
+						},
+						args...,
+					),
+				); err != nil {
+					return err
+				}
+			}
+
+			return nil
+		},
+	}
+
+	scanInfo.TriggeredByCLI = true
+
+	scanCmd.PersistentFlags().StringVar(&scanContractPath, "scan-contract", "", "Path to an explicit repository scan contract")
+	scanCmd.PersistentFlags().StringVar(&scanContractName, "contract", "", "Named contract to select; defaults to spec.defaultContract")
+	scanCmd.PersistentFlags().StringArrayVar(&scanContractAllow, "contract-allow", nil, "Comma-separated list of contract sections allowed to take effect: policy, scope, evaluation, failure, output (defaults to all)")
+
+	scanCmd.PersistentFlags().StringVarP(&scanInfo.AccountID, "account", "", "", "Kubescape SaaS account ID. Default will load account ID from cache")
+	scanCmd.PersistentFlags().StringVarP(&scanInfo.AccessKey, "access-key", "", "", "Kubescape SaaS access key. Default will load access key from cache")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.ControlsInputs, "controls-config", "", "Path to an controls-config obj. If not set will download controls-config from ARMO management portal")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.UseExceptions, "exceptions", "", "Path to an exceptions obj. If not set will download exceptions from ARMO management portal")
+	scanCmd.PersistentFlags().BoolVar(&scanInfo.AuditExceptions, "audit-exceptions", false, "Include an exception usage audit in supported scan outputs")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.UseArtifactsFrom, "use-artifacts-from", "", "Load artifacts from local directory. If not used will download them")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.CustomRules, "custom-rules", "", "Path to user-authored custom rules: a ValidatingAdmissionPolicy (.yaml/.yml) file, a rule directory holding raw.rego and rule.metadata.json (the layout used by 'kubescape policy test'), a directory of such rule directories, or a directory of bare *.rego and *.yaml/*.yml files. A rule's declared match selectors or matchConstraints are honoured; a bare .rego file is matched against every resource kind. A custom rule is medium severity unless its source declares '# @baseScore <1-10>'")
+	scanCmd.PersistentFlags().StringVarP(&scanInfo.ExcludedNamespaces, "exclude-namespaces", "e", "", "Namespaces to exclude from scanning. e.g: --exclude-namespaces ns-a,ns-b. Cannot be used together with --include-namespaces. Notice, when running with --exclude-namespaces kubescape does not scan cluster-scoped objects.")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.MinSeverity, "min-severity", "", "Only include findings at or above this severity (low, medium, high, critical) in the output. Applies to posture controls and image vulnerabilities. Does not affect exit codes, which are computed on the full unfiltered report")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.MaxSeverity, "max-severity", "", "Only include findings at or below this severity (low, medium, high, critical) in the output. Applies to posture controls and image vulnerabilities. Does not affect exit codes, which are computed on the full unfiltered report")
+
+	scanCmd.PersistentFlags().Float32VarP(&scanInfo.ComplianceThreshold, "compliance-threshold", "", 0, "Compliance threshold is the percent below which the command fails and returns exit code 1. Applies to 'scan framework', 'scan control', 'scan workload', and '--view resource|control'")
+	scanCmd.PersistentFlags().Float32Var(&scanInfo.FailCoverageThreshold, "fail-coverage-below", 0, "Fail (exit code 1) when the scan coverage score drops below this percentage (0 to disable). The score is the ratio of evaluated controls discounted by 3 points per silent failed GVR pull (a resource type that failed to collect entirely but whose dependent controls still evaluated via other resource types), 2 points per partial GVR pull, and 5 points per degraded policy input, so a scan with every control evaluated can still fail on partial resource collection or fallback policy inputs")
+	scanCmd.PersistentFlags().BoolVar(&scanInfo.FailOnDegradedConfig, "fail-on-degraded-config", false, "Fail the scan (exit code 1) if control configurations or exceptions could not be loaded from their configured source and bundled defaults were used instead")
+
+	scanCmd.PersistentFlags().StringVar(&scanInfo.FailThresholdSeverity, "severity-threshold", "", "Severity threshold is the severity of failed controls at which the command fails and returns exit code 1. Failed controls whose severity is unknown (missing base score) are treated as exceeding any threshold. On image scans, vulnerabilities whose severity cannot be determined are likewise counted as exceeding any threshold")
+	scanCmd.PersistentFlags().BoolVar(&scanInfo.OnlyFixable, "only-fixable", false, "When used with --severity-threshold, --fail-on-kev or --epss-threshold on image scans, only count CVEs that have an available fix toward the pass/fail decision")
+	scanCmd.PersistentFlags().BoolVar(&scanInfo.FailOnKEV, "fail-on-kev", false, "Fail image scans (exit code 1) when any vulnerability is listed in the CISA Known Exploited Vulnerabilities catalog, whatever its severity. Applies to 'scan image', 'scan workload' and scans with --scan-images. Image exceptions waive matching vulnerabilities")
+	scanCmd.PersistentFlags().Float64Var(&scanInfo.EPSSThreshold, "epss-threshold", 0, "Fail image scans (exit code 1) when any vulnerability's EPSS score is at or above this value, between 0 and 1 (0 disables the gate). Applies to 'scan image', 'scan workload' and scans with --scan-images. EPSS scores change daily, so pair this with --max-db-age and --fail-on-stale-db, especially with an offline vulnerability database")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.ControlsVersion, "controls-version", "", "Pin the regolibrary release tag used to download controls (see https://github.com/kubescape/regolibrary/releases). If not used will download the latest release. Has no effect when --account is set (cloud backend is used instead)")
+
+	// --fail-threshold was removed as a functioning flag, but its registration must stay so
+	// pflag/cobra keep accepting it instead of erroring with "unknown flag" for callers who
+	// still pass it (e.g. existing CI pipelines). Same pattern as the --id/--environment/--env
+	// deprecated-flag fix in cmd/list/list.go and cmd/root.go: bind to a standalone variable,
+	// not scanInfo, so legacy input can't leak into report metadata or threshold validation.
+	var dummyFailThreshold float32
+	scanCmd.PersistentFlags().Float32VarP(&dummyFailThreshold, "fail-threshold", "t", 100, "Deprecated, use '--compliance-threshold' instead")
+	_ = scanCmd.PersistentFlags().MarkHidden("fail-threshold")
+	_ = scanCmd.PersistentFlags().MarkDeprecated("fail-threshold", "use '--compliance-threshold' flag instead")
+
+	// Tri-state flag bound to the same BoolPtrFlag as the removed --enable-host-scan:
+	// not passed -> auto-detect node-agent CRDs; --host-scan=false -> opt out of
+	// host data collection; --host-scan=true -> force host data collection on.
+	hostF := scanCmd.PersistentFlags().VarPF(&scanInfo.HostSensorEnabled, "host-scan", "", "Enable host data collection from cluster nodes for certain controls. When not set, Kubescape auto-detects node-agent CRDs and uses a CRD-based host sensor if available. Use --host-scan=false to disable host data collection. See https://github.com/kubescape/helm-charts/tree/main/charts/kubescape-operator for the operator-based alternative")
+	hostF.NoOptDefVal = "true"
+
+	// Off by default for live-cluster scans, on by default for local manifest scans.
+	honorInlineF := scanCmd.PersistentFlags().VarPF(&scanInfo.HonorInlineExceptions, "honor-inline-exceptions", "", "Honor kubescape.io/skip-* annotations as inline exception policies. By default this is enabled when scanning local manifest files and disabled for live-cluster scans")
+	honorInlineF.NoOptDefVal = "true"
+
+	scanCmd.PersistentFlags().StringVarP(&scanInfo.Format, "format", "f", "pretty-printer", fmt.Sprintf(`Output file format. Supported formats: "%s"`, strings.Join(shared.ScanFormats, `", "`)))
+	scanCmd.PersistentFlags().StringVar(&scanInfo.IncludeNamespaces, "include-namespaces", "", "scan specific namespaces. e.g: --include-namespaces ns-a,ns-b. Cannot be used together with --exclude-namespaces")
+	scanCmd.PersistentFlags().StringSliceVar(&scanInfo.ExcludeControls, "exclude-controls", nil, "Controls to leave out of the scan, by control ID (case-insensitive), applied to every framework in the scan. A control's CIS section number is accepted where the control carries one. Excluded controls are not evaluated and do not affect the compliance score. e.g: --exclude-controls C-0016,C-0017")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.IncludeKinds, "include-kinds", "", "scan only the specified Kubernetes resource kinds (case-insensitive, Kind name only — not group/version qualified). e.g: --include-kinds Deployment,DaemonSet")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.ExcludeKinds, "exclude-kinds", "", "exclude the specified Kubernetes resource kinds from the scan (case-insensitive, Kind name only — not group/version qualified). e.g: --exclude-kinds Job,CronJob")
+	scanCmd.PersistentFlags().StringArrayVar(&scanInfo.ExcludePaths, "exclude-path", nil, fmt.Sprintf("Exclude paths from file, directory and repository scans (repeat for more than one). Patterns use gitignore syntax and are relative to the scan root, e.g: --exclude-path 'test/**' --exclude-path '!test/prod.yaml'. Combined with the patterns in a %s file at the scan root. Helm charts, Kustomize configurations and Terraform modules are excluded as whole directories", cautils.IgnoreFileName))
+	scanCmd.PersistentFlags().BoolVar(&scanInfo.NoIgnoreFile, "no-ignore-file", false, fmt.Sprintf("Ignore the %s file at the scan root; only --exclude-path patterns apply", cautils.IgnoreFileName))
+	scanCmd.PersistentFlags().StringVar(&scanInfo.LabelSelector, "label-selector", "", "Filter collected Kubernetes resources by label selector. Accepts any selector that kubectl -l supports, e.g: --label-selector app=nginx,env!=dev")
+	scanCmd.PersistentFlags().BoolVarP(&scanInfo.Local, "keep-local", "", false, "If you do not want your Kubescape results reported to configured backend.")
+	scanCmd.PersistentFlags().StringVarP(&scanInfo.Output, "output", "o", "", "Output file. Print output to file and not stdout")
+	scanCmd.PersistentFlags().StringArrayVar(&scanInfo.NotifyURLs, "notify", nil, "POST the scan summary to this webhook URL; Slack incoming webhooks use Block Kit and Microsoft Teams webhooks an Adaptive Card; repeat for multiple destinations")
+	scanCmd.PersistentFlags().BoolVarP(&scanInfo.VerboseMode, "verbose", "v", false, "Display all of the input resources and not only failed resources")
+	scanCmd.PersistentFlags().BoolVarP(&scanInfo.ShowEvidence, "show-evidence", "E", false, "Show evidence paths with current field values for each failed control (pretty-printer only)")
+	scanCmd.PersistentFlags().BoolVar(&scanInfo.ShowSecrets, "show-secrets", false, "Show secret field values in evidence output. By default secret values are redacted. Only effective with --show-evidence")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.View, "view", string(cautils.SecurityViewType), fmt.Sprintf("View results based on the %s/%s/%s/%s. default is --view=%s", cautils.ResourceViewType, cautils.ControlViewType, cautils.SecurityViewType, cautils.NamespaceViewType, cautils.SecurityViewType))
+	scanCmd.PersistentFlags().BoolVar(&scanInfo.UseDefault, "use-default", false, "Load local policy object from default path. If not used will download latest")
+	scanCmd.PersistentFlags().StringSliceVar(&scanInfo.UseFrom, "use-from", nil, "Load local policy object from specified path. If not used will download latest")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.FormatVersion, "format-version", "v2", "Output object can be different between versions, this is for maintaining backward and forward compatibility. Supported:'v1'/'v2'")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.CustomClusterName, "cluster-name", "", "Set the custom name of the cluster. Not same as the kube-context flag")
+	submitF := scanCmd.PersistentFlags().VarPF(&scanInfo.Submit, "submit", "", "Submit the scan results to Kubescape SaaS where you can see the results in a user-friendly UI, choose your preferred compliance framework, check risk results history and trends, manage exceptions, get remediation recommendations and much more. By default the results are not submitted")
+	submitF.NoOptDefVal = "true"
+	submitF.DefValue = "false"
+	scanCmd.PersistentFlags().BoolVarP(&scanInfo.OmitRawResources, "omit-raw-resources", "", false, "Omit raw resources from the output. By default the raw resources are included in the output")
+	scanCmd.PersistentFlags().BoolVarP(&scanInfo.PrintAttackTree, "print-attack-tree", "", false, "Print attack tree")
+	scanCmd.PersistentFlags().BoolVarP(&scanInfo.EnableRegoPrint, "enable-rego-prints", "", false, "Enable sending to rego prints to the logs (use with debug log level: -l debug)")
+	scanCmd.PersistentFlags().BoolVarP(&scanInfo.ScanImages, "scan-images", "", false, "Scan resources images")
+	scanCmd.PersistentFlags().IntVar(&scanInfo.ImageScanConcurrency, "image-scan-concurrency", 1, "Number of concurrent workers for image scanning")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.ImagePlatform, "image-platform", "", "OCI platform for --scan-images, for example linux/amd64; overrides platform inferred from workload scheduling constraints")
+	scanCmd.PersistentFlags().BoolVarP(&scanInfo.UseDefaultMatchers, "use-default-matchers", "", true, "Use default matchers (true) or CPE matchers (false) for image scanning")
+	scanCmd.PersistentFlags().StringToStringVar(&scanInfo.RegistryMapping, "registry-mapping", nil, "Map internal registry hosts to reachable ones, e.g. --registry-mapping image-registry.openshift-image-registry.svc:5000=registry.company.com (host[:port], no scheme)")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.RegistryUsername, "registry-username", "", "Username for image registry login when no docker config or credential helper is available; can also be set with KUBESCAPE_REGISTRY_USERNAME")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.RegistryPassword, "registry-password", "", "Password for image registry login when no docker config or credential helper is available; can also be set with KUBESCAPE_REGISTRY_PASSWORD")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.RegistryToken, "registry-token", "", "Bearer token for image registry login when no docker config or credential helper is available; can also be set with KUBESCAPE_REGISTRY_TOKEN")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.RegistryAuthority, "registry-authority", "", "Registry host[:port] the --scan-images credentials apply to")
+	scanCmd.PersistentFlags().BoolVar(&scanInfo.Hide, "hide", false, "Replace sensitive report metadata with deterministic pseudonyms")
+	scanCmd.PersistentFlags().BoolVar(&scanInfo.EncryptionEnabled, "encrypt", false, "Encrypt sensitive report metadata using the KUBESCAPE_MASTER_KEY environment variable")
+	scanCmd.PersistentFlags().StringSliceVar(&scanInfo.LabelsToCopy, "labels-to-copy", nil, "Labels to copy from workloads to scan reports for easy identification. e.g: --labels-to-copy=app,team,environment")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.SkipControls, "skip-controls", "", "Comma-separated control IDs to skip (case-insensitive). A control's CIS section number is accepted where the control carries one. e.g. --skip-controls C-0001,C-0020")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.IncludeControls, "include-controls", "", "Comma-separated control IDs to include (case-insensitive); all other controls are skipped. A control's CIS section number is accepted where the control carries one. e.g. --include-controls C-0001,C-0002")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.ListingURL, "grype-db-url", "", "Grype vulnerability database URL")
+	scanCmd.PersistentFlags().BoolVar(&scanInfo.SkipDBUpdate, "skip-db-update", false, "Do not update the vulnerability database before scanning images. Uses the locally cached database; fails if none is cached.")
+	scanCmd.PersistentFlags().BoolVar(&scanInfo.FailOnStaleDB, "fail-on-stale-db", false, "Fail image scans when the vulnerability database is older than --max-db-age (default: warn only). An explicitly passed value (even false) wins over KS_FAIL_ON_STALE_DB. Failing requires network access for the update check when the DB is updated.")
+	scanCmd.PersistentFlags().DurationVar(&scanInfo.MaxDBAge, "max-db-age", 0, "Maximum allowed age of the vulnerability database before it is considered stale (e.g. 120h, 168h). Warns always; fails only with --fail-on-stale-db. 0 selects the default (120h). An explicitly passed value (even 0) wins over KS_MAX_DB_AGE.")
+	scanCmd.PersistentFlags().DurationVar(&scanInfo.ScanTimeout, "scan-timeout", 0, "Maximum duration for the scan (e.g. 5m, 30s, 1h). 0 means no timeout. When the timeout is reached the scan exits with a non-zero code.")
+	scanCmd.PersistentFlags().DurationVar(&scanInfo.ControlTimeout, "control-timeout", 0, "Maximum duration for evaluating a single control (e.g. 30s, 1m). 0 means no timeout. Controls that exceed this are marked as not evaluated and the scan continues. Must be lower than --scan-timeout when both are set.")
+	scanCmd.PersistentFlags().BoolVar(&scanInfo.EnableStreaming, "enable-streaming", false, "Enable resource streaming for large clusters to reduce memory usage. Resources are processed in batches instead of loading all at once. Automatically enabled for clusters with >2500 resources.")
+	scanCmd.PersistentFlags().StringVar((*string)(&scanInfo.WholeClusterPolicy), "whole-cluster-policy", string(cautils.WholeClusterPolicyProjected), "Execution policy for whole-cluster controls (C-0261, C-0266, C-0267, C-0272): 'projected' (incremental projection of matching resources), 'fallback' (materialize full cluster in memory), 'skip' (skip whole-cluster controls for minimum memory), or 'verify' (debug parity check between projected and fallback; mismatches fail the scan with a non-zero exit code).")
+	scanCmd.PersistentFlags().BoolVar(&scanInfo.DryRun, "dry-run", false, "Check whether the current credentials can list every resource type the requested policies need, without collecting resources or evaluating controls. Cluster scans only.")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.OtelEndpoint, "otel-endpoint", "", fmt.Sprintf("Export scan traces and metrics to an OTLP collector, e.g. --otel-endpoint localhost:4317. Accepts host:port (plaintext) or a http(s):// URL. When unset, the standard %s environment variable is used; when neither is set no telemetry is collected.", telemetry.EnvEndpoint))
+	scanCmd.PersistentFlags().BoolVar(&scanInfo.Incremental, "incremental", false, "Cache the verdict for each resource, keyed by a hash of its spec/metadata plus the controls-config version, and skip re-evaluating unchanged resources on the next scan. Opt-in; scan output is unaffected. Cache automatically invalidates when the controls-config version changes; clear it manually with 'kubescape config delete cache'.")
+	scanCmd.PersistentFlags().IntVar(&gitCloneDepth, "git-clone-depth", cautils.DefaultGitCloneDepth, "Clone depth for remote Git repository scans (default: 0 for full commit history; e.g. 1 for shallow tip-only clone)")
+
+	// Helm value override flags. Mirror `helm install` so users can pass overrides through verbatim
+	// when scanning a Helm chart directory. Note: -f is already taken by --format, so --values is long-only.
+	//
+	// Flag-binding choices match upstream Helm (helm.sh/helm/v3 cmd/helm/flags.go) exactly:
+	//   --values     -> StringSliceVar : Helm splits on commas, so `--values a.yaml,b.yaml` is two files.
+	//   --set        -> StringArrayVar : verbatim; commas inside the value belong to the strvals parser
+	//                                    and must survive (e.g. `--set tolerations={a,b}`).
+	//   --set-string -> StringArrayVar : same reasoning as --set.
+	//   --set-file   -> StringArrayVar : same reasoning as --set.
+	scanCmd.PersistentFlags().StringSliceVar(&scanInfo.HelmValueFiles, "values", nil, "Specify Helm values in a YAML file or a URL when scanning a Helm chart (can specify multiple, or separate paths with commas)")
+	scanCmd.PersistentFlags().StringArrayVar(&scanInfo.HelmSetValues, "set", nil, "Set Helm values on the command line when scanning a Helm chart (can specify multiple, e.g. --set key1=val1 --set key2=val2)")
+	scanCmd.PersistentFlags().StringArrayVar(&scanInfo.HelmSetStringValues, "set-string", nil, "Set Helm STRING values on the command line when scanning a Helm chart (can specify multiple)")
+	scanCmd.PersistentFlags().StringArrayVar(&scanInfo.HelmSetFileValues, "set-file", nil, "Set Helm values from respective files specified via the command line (can specify multiple)")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.HelmReleaseName, "release-name", "", "Helm release name made available as .Release.Name when rendering the chart")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.HelmReleaseNamespace, "release-namespace", "", "Helm release namespace made available as .Release.Namespace when rendering the chart")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.HelmKubeVersion, "kube-version", "", "Kubernetes version made available as .Capabilities.KubeVersion when rendering a Helm chart (e.g. 1.31). Defaults to the newest version the chart's kubeVersion allows, or v1.20 when it declares none")
+	scanCmd.PersistentFlags().StringSliceVar(&scanInfo.HelmAPIVersions, "api-versions", nil, "Kubernetes API versions added to .Capabilities.APIVersions when rendering a Helm chart (can specify multiple, or separate values with commas)")
+
+	// hidden flags
+	_ = scanCmd.PersistentFlags().MarkHidden("omit-raw-resources") // #nosec G104 -- flag defined on this command; MarkHidden only errors for an unknown flag
+	_ = scanCmd.PersistentFlags().MarkHidden("print-attack-tree")  // #nosec G104 -- flag defined on this command; MarkHidden only errors for an unknown flag
+	_ = scanCmd.PersistentFlags().MarkHidden("format-version")     // #nosec G104 -- flag defined on this command; MarkHidden only errors for an unknown flag
+
+	// Retrieve --kubeconfig flag from https://github.com/kubernetes/kubectl/blob/master/pkg/cmd/cmd.go
+	scanCmd.PersistentFlags().AddGoFlag(flag.Lookup("kubeconfig"))
+
+	scanCmd.PersistentFlags().StringSliceVar(&scanInfo.KubeContexts, "kube-contexts", nil, "Scan each of these kube contexts in one run (comma-separated, or repeat the flag), writing one report per context to a context-suffixed --output path. Requires --output. Distinct from --kube-context, which selects a single context; when --kube-contexts is set it takes over the scan instead.")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.FleetReport, "fleet-report", "", "With --kube-contexts, also write one combined JSON report across every scanned context to this path, alongside the per-context reports. Every requested context appears in it, including the ones that could not be scanned, with a control-by-cluster matrix over those that could. Not supported with --hide or --encrypt.")
+
+	scanCmd.PersistentFlags().StringVar(&fleetConfigPath, "fleet-config", "", "Path to a fleet config file (kind FleetConfig) with the contexts to scan and where the reports go: contexts, output, fleetReport, referenceCluster and retries. A flag given on the command line overrides the same setting in the file.")
+
+	scanCmd.PersistentFlags().IntVar(&scanInfo.KubeContextParallel, "parallel", 1, "With --kube-contexts, how many contexts to scan at once. Above 1, each context is scanned in its own kubescape process, since one process can only talk to one cluster at a time.")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.FleetChildResult, "fleet-child-result", "", "Internal: where a --parallel child process writes its context's result for the parent.")
+	_ = scanCmd.PersistentFlags().MarkHidden("fleet-child-result") // #nosec G104 -- flag defined on this command; MarkHidden only errors for an unknown flag
+	scanCmd.PersistentFlags().IntVar(&scanInfo.KubeContextRetries, "retries", 2, "With --kube-contexts, how many more times to try a cluster whose API server never answered, waiting 2s, then 4s, doubling up to 30s between attempts. A cluster that answered with an error, or whose scan was cancelled, is not retried. 0 disables retries.")
+
+	scanCmd.PersistentFlags().StringVar(&scanInfo.ReferenceCluster, "reference-cluster", "", "With --fleet-report, the kube context whose findings the other clusters are read against, so the combined report shows what that cluster found on every control they disagree on. Must be one of --kube-contexts. Without it the report simply says where the clusters disagree.")
+
+	scanCmd.PersistentFlags().StringVar(&scanInfo.Baseline, "baseline", "", "Path to a saved JSON scan report to diff the fresh scan against.")
+	scanCmd.PersistentFlags().BoolVar(&scanInfo.BaselineFailOnNew, "baseline-fail-on-new", false, "With --baseline, exit with code 1 when new failures are found versus the baseline.")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.BaselineSeverityThreshold, "baseline-severity-threshold", "", "With --baseline, only count new failures at or above this severity when using --baseline-fail-on-new.")
+	scanCmd.PersistentFlags().StringVar(&scanInfo.BaselineGranularity, "baseline-granularity", "evidence", "With --baseline, comparison unit: evidence or control.")
+
+	scanCmd.Flags().StringVar(&scanInfo.FilePath, "file-path", "", "Path to the YAML file.")
+	scanCmd.Flags().BoolVar(&watchMode, "watch", false, "Scan the given files or directories, then scan again whenever they change, and say which findings are new, resolved or unchanged, until interrupted. Local manifests only: not for a cluster, an image scan or a remote repository, and not with --format, --output, --baseline or the threshold flags")
+
+	scanCmd.AddCommand(getControlCmd(ks, &scanInfo))
+	scanCmd.AddCommand(getFrameworkCmd(ks, &scanInfo))
+	scanCmd.AddCommand(getWorkloadCmd(ks, &scanInfo))
+
+	scanCmd.AddCommand(getImageCmd(ks, &scanInfo))
+	scanCmd.AddCommand(getValidateContractCmd(&scanInfo))
+
+	// Wrap after the subcommands are registered so each one is covered.
+	installTelemetry(scanCmd, ks, &scanInfo)
+
+	return scanCmd
+}
+
+func setContractScanTarget(args []string, scanInfo *cautils.ScanInfo) {
+	if len(scanInfo.InputPatterns) > 0 || len(args) > 0 {
+		scanInfo.SetScanType(cautils.ScanTypeRepo)
+		if len(scanInfo.InputPatterns) == 0 {
+			scanInfo.InputPatterns = args
+		}
+		return
+	}
+	scanInfo.SetScanType(cautils.ScanTypeCluster)
+}
+
+func validateCombinedImageScanFlags(scanInfo *cautils.ScanInfo) error {
+	if scanInfo == nil || !scanInfo.ScanImages {
+		return nil
+	}
+	if err := shared.ValidateImageScanInfo(scanInfo); err != nil {
+		return err
+	}
+	return shared.ValidateWorkloadImageCredentials(shared.ImageCredentials{
+		Authority: scanInfo.RegistryAuthority,
+		Username:  scanInfo.RegistryUsername,
+		Password:  scanInfo.RegistryPassword,
+		Token:     scanInfo.RegistryToken,
+	})
+}
+
+func applyRegistryCredentialsFromEnv(cmd *cobra.Command, scanInfo *cautils.ScanInfo) {
+	if scanInfo == nil {
+		return
+	}
+	usernameFlagChanged := shared.RegistryCredentialFlagChanged(cmd, "registry-username", "username")
+	passwordFlagChanged := shared.RegistryCredentialFlagChanged(cmd, "registry-password", "password")
+	tokenFlagChanged := shared.RegistryCredentialFlagChanged(cmd, "registry-token")
+
+	if !tokenFlagChanged && !usernameFlagChanged && scanInfo.RegistryUsername == "" {
+		scanInfo.RegistryUsername = os.Getenv(shared.RegistryUsernameEnvVar)
+	}
+	if !tokenFlagChanged && !passwordFlagChanged && scanInfo.RegistryPassword == "" {
+		scanInfo.RegistryPassword = os.Getenv(shared.RegistryPasswordEnvVar)
+	}
+	if !tokenFlagChanged && !usernameFlagChanged && !passwordFlagChanged && scanInfo.RegistryToken == "" {
+		scanInfo.RegistryToken = os.Getenv(shared.RegistryTokenEnvVar)
+	}
+}
+
+func setSecurityViewScanInfo(args []string, scanInfo *cautils.ScanInfo) []cautils.PolicyIdentifier {
+	if len(scanInfo.InputPatterns) > 0 || len(args) > 0 {
+		scanInfo.SetScanType(cautils.ScanTypeRepo)
+		if len(scanInfo.InputPatterns) == 0 {
+			scanInfo.InputPatterns = args
+		}
+		return cautils.BuildPolicyIdentifiers([]string{"workloadscan", "allcontrols"}, v1.KindFramework)
+	}
+	scanInfo.SetScanType(cautils.ScanTypeCluster)
+	return cautils.BuildPolicyIdentifiers([]string{"clusterscan", "mitre", "nsa"}, v1.KindFramework)
+}
+
+// deriveTimeoutContext returns a context bound to ks.Context() with a
+// deadline of scanInfo.ScanTimeout, when that's > 0, and a cancel func the
+// caller must defer. When ScanTimeout <= 0 it returns ks.Context() unchanged
+// and a no-op cancel. It never calls ks.SetContext: the derived context is
+// threaded explicitly through ScanContext/HandleResults/enforceBaselineDrift
+// instead of being stashed on the shared ks, so it can't be observed or
+// clobbered by another operation sharing the same *Kubescape instance.
+func deriveTimeoutContext(scanInfo *cautils.ScanInfo, ks meta.IKubescape) (context.Context, func()) {
+	if ks == nil {
+		return context.Background(), func() {}
+	}
+	if scanInfo.ScanTimeout <= 0 {
+		return ks.Context(), func() {}
+	}
+	return context.WithTimeout(ks.Context(), scanInfo.ScanTimeout)
+}
+
+func securityScan(scanInfo cautils.ScanInfo, ks meta.IKubescape, policyIdentifiers []cautils.PolicyIdentifier) error {
+	if len(scanInfo.KubeContexts) > 0 {
+		return fleetScan(scanInfo, ks, policyIdentifiers, runSecurityScan)
+	}
+
+	ctx, cancel := deriveTimeoutContext(&scanInfo, ks)
+	defer cancel()
+	_, err := runSecurityScan(ctx, &scanInfo, ks, policyIdentifiers)
+	return err
+}
+
+// runSecurityScan runs one cluster's scan to completion: Scan, HandleResults,
+// then every threshold/drift enforcement securityScan performs for the
+// single-context path. It's factored out so fleetScan (cmd/scan/fleetscan.go)
+// can run the exact same per-cluster behavior once per requested context,
+// instead of a parallel, divergent copy of this logic.
+func runSecurityScan(ctx context.Context, scanInfo *cautils.ScanInfo, ks meta.IKubescape, policyIdentifiers []cautils.PolicyIdentifier) (*resultshandling.ResultsHandler, error) {
+	results, err := ks.ScanContext(ctx, scanInfo, policyIdentifiers)
+	if err != nil {
+		return nil, err
+	}
+	if scanInfo.DryRun {
+		// The preflight verdict is already printed and nothing was evaluated:
+		// there is no report to write or submit and no threshold to enforce.
+		return results, nil
+	}
+
+	if err = results.HandleResults(ctx, scanInfo); err != nil {
+		return results, err
+	}
+
+	if err := joinGateErrors(
+		enforceSeverityThresholds(&results.GetData().Report.SummaryDetails, scanInfo),
+		enforceCombinedImageGates(results, scanInfo),
+	); err != nil {
+		return results, err
+	}
+	if err := enforceCoverageThreshold(results.GetData().ScanCoverage, len(results.GetData().Report.SummaryDetails.Controls), scanInfo); err != nil {
+		return results, err
+	}
+	if err := enforcePolicyDegradation(results.GetData().ScanCoverage, scanInfo); err != nil {
+		return results, err
+	}
+
+	return results, enforceBaselineDrift(ctx, results, scanInfo)
+}
+
+// joinGateErrors combines gate failures so one breach does not hide another.
+// A lone failure is returned unchanged.
+func joinGateErrors(errs ...error) error {
+	var failed []error
+	for _, err := range errs {
+		if err != nil {
+			failed = append(failed, err)
+		}
+	}
+	switch len(failed) {
+	case 0:
+		return nil
+	case 1:
+		return failed[0]
+	default:
+		return errors.Join(failed...)
+	}
+}
+
+// enforceComplianceThreshold fails the scan when the compliance score is below --compliance-threshold.
+func enforceComplianceThreshold(score float32, scanInfo *cautils.ScanInfo) error {
+	if score < scanInfo.ComplianceThreshold {
+		return gateFailure(fmt.Errorf("scan compliance-score is below permitted threshold: %s (compliance-threshold: %.2f)", cautils.ComplianceScoreToString(score, 2), scanInfo.ComplianceThreshold))
+	}
+	return nil
+}
+
+// enforceCombinedImageGates applies the image gates when --scan-images is set.
+func enforceCombinedImageGates(results *resultshandling.ResultsHandler, scanInfo *cautils.ScanInfo) error {
+	if !scanInfo.ScanImages {
+		return nil
+	}
+	return enforceImageGates(results.ImageScanData, scanInfo)
+}
+
+func enforceBaselineDrift(ctx context.Context, results *resultshandling.ResultsHandler, scanInfo *cautils.ScanInfo) error {
+	newFailures, err := core.EnforceBaseline(ctx, results, scanInfo)
+	if err != nil {
+		return err
+	}
+	if scanInfo.BaselineFailOnNew && newFailures > 0 {
+		return gateFailure(fmt.Errorf("baseline drift: found %d new failure(s) at or above baseline severity threshold %q", newFailures, severityLabelOrAll(scanInfo.BaselineSeverityThreshold)))
+	}
+	return nil
+}
+
+// gateError marks a scan that completed but failed a gate the operator set, such as a threshold or baseline drift.
+type gateError struct {
+	err error
+}
+
+func (e gateError) Error() string { return e.err.Error() }
+
+func (e gateError) Unwrap() error { return e.err }
+
+// gateFailure marks err as a failed gate.
+func gateFailure(err error) error { return gateError{err: err} }
+
+// isGateFailure reports whether err is a failed gate.
+func isGateFailure(err error) bool {
+	var gate gateError
+	return errors.As(err, &gate)
+}
+
+// validateBaselineFlags validates baseline drift gating flags for posture scans.
+func validateBaselineFlags(cmd *cobra.Command, scanInfo *cautils.ScanInfo) error {
+	if cmd != nil && cmd.Name() == "image" {
+		return nil
+	}
+
+	if commandFlagChanged(cmd, "baseline") && strings.TrimSpace(scanInfo.Baseline) == "" {
+		return fmt.Errorf("--baseline cannot be empty")
+	}
+
+	if strings.TrimSpace(scanInfo.Baseline) == "" {
+		if scanInfo.BaselineFailOnNew || commandFlagChanged(cmd, "baseline-fail-on-new") {
+			return fmt.Errorf("--baseline-fail-on-new requires --baseline")
+		}
+		if strings.TrimSpace(scanInfo.BaselineSeverityThreshold) != "" || commandFlagChanged(cmd, "baseline-severity-threshold") {
+			return fmt.Errorf("--baseline-severity-threshold requires --baseline")
+		}
+		if (scanInfo.BaselineGranularity != "" && scanInfo.BaselineGranularity != "evidence") || commandFlagChanged(cmd, "baseline-granularity") {
+			return fmt.Errorf("--baseline-granularity requires --baseline")
+		}
+		return nil
+	}
+
+	if strings.TrimSpace(scanInfo.BaselineSeverityThreshold) != "" {
+		if err := shared.ValidateSeverity(scanInfo.BaselineSeverityThreshold); err != nil {
+			return err
+		}
+		scanInfo.BaselineSeverityThreshold = strings.ToLower(strings.TrimSpace(scanInfo.BaselineSeverityThreshold))
+	}
+
+	if err := resultsdiff.ValidateGranularity(scanInfo.BaselineGranularity); err != nil {
+		return err
+	}
+	scanInfo.BaselineGranularity = strings.ToLower(strings.TrimSpace(scanInfo.BaselineGranularity))
+	if scanInfo.BaselineGranularity == "" {
+		scanInfo.BaselineGranularity = string(resultsdiff.GranularityEvidence)
+	}
+
+	return nil
+}
+
+func severityLabelOrAll(s string) string {
+	if s == "" {
+		return "all"
+	}
+	return s
+}
+
+// enforceImageGates applies every image vulnerability gate. The severity
+// failure keeps its existing message; a tripped exploitability gate is
+// reported alongside it.
+func enforceImageGates(imageScanData []cautils.ImageScanData, scanInfo *cautils.ScanInfo) error {
+	return joinGateErrors(
+		enforceImageSeverityThresholds(imageScanData, scanInfo),
+		enforceImageRiskGates(imageScanData, scanInfo),
+	)
+}
+
+// enforceImageRiskGates fails the scan when --fail-on-kev or --epss-threshold
+// is breached by any scanned image.
+func enforceImageRiskGates(imageScanData []cautils.ImageScanData, scanInfo *cautils.ScanInfo) error {
+	gates := imagescan.RiskGates{FailOnKEV: scanInfo.FailOnKEV, EPSSThreshold: scanInfo.EPSSThreshold}
+	if err := imagescan.CheckRiskGates(gates, imageScanData, scanInfo.OnlyFixable); err != nil {
+		return gateFailure(err)
+	}
+	return nil
+}
+
+func enforceImageSeverityThresholds(imageScanData []cautils.ImageScanData, scanInfo *cautils.ScanInfo) error {
+	if scanInfo.FailThresholdSeverity == "" {
+		return nil
+	}
+
+	thresholdSeverity := imagescan.ParseSeverity(scanInfo.FailThresholdSeverity)
+	if thresholdSeverity == vulnerability.UnknownSeverity {
+		return nil
+	}
+
+	// Drain every Enumerate() channel fully: each is fed by a goroutine over
+	// an unbuffered channel, so an early return would strand the producer
+	// and leak a goroutine per call. A single full pass also makes the
+	// unknown count order-independent: a determinate breach no longer hides
+	// later unknowns from the message.
+	breach, unknownCount := false, 0
+	for _, data := range imageScanData {
+		for m := range data.Matches.Enumerate() {
+			matchSeverity, unknown := imagescan.MatchSeverity(m, data.VulnerabilityProvider)
+			if unknown {
+				// Fail closed, mirroring the posture gate: an indeterminate
+				// CVE must not silently pass. The onlyFixable carve-out is
+				// preserved only for definitively unfixable CVEs.
+				if scanInfo.OnlyFixable && imagescan.IsDefinitivelyUnfixable(m.Vulnerability.Fix.State) {
+					continue
+				}
+				unknownCount++
+				continue
+			}
+
+			if matchSeverity >= thresholdSeverity &&
+				(!scanInfo.OnlyFixable || m.Vulnerability.Fix.State == vulnerability.FixStateFixed) {
+				breach = true
+			}
+		}
+	}
+	if breach || unknownCount > 0 {
+		return gateFailure(thresholdExceededError(scanInfo.FailThresholdSeverity, unknownCount))
+	}
+	return nil
+}
+
+// thresholdExceededError keeps the base message byte-identical when no
+// unknown-severity CVE contributed, so existing consumers are unaffected;
+// the unknown count is appended only when it is non-zero.
+func thresholdExceededError(threshold string, unknownCount int) error {
+	if unknownCount > 0 {
+		return fmt.Errorf("image scan result exceeds severity threshold: %s (%d vulnerability(s) with unknown severity counted as exceeding)", threshold, unknownCount)
+	}
+	return fmt.Errorf("image scan result exceeds severity threshold: %s", threshold)
+}

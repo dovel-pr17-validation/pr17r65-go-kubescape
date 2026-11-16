@@ -1,0 +1,428 @@
+package cautils
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
+)
+
+// typedResourceGVK maps the typed kubernetes_* Terraform provider resources we
+// support to the apiVersion/kind of the K8s object they represent. Only
+// resources with a stable, well-known shape are listed here — anything not in
+// this table is left unscanned rather than guessed at, same policy as
+// kubernetes_manifest.
+var typedResourceGVK = map[string]struct{ apiVersion, kind string }{
+	"kubernetes_deployment":           {"apps/v1", "Deployment"},
+	"kubernetes_deployment_v1":        {"apps/v1", "Deployment"},
+	"kubernetes_stateful_set":         {"apps/v1", "StatefulSet"},
+	"kubernetes_stateful_set_v1":      {"apps/v1", "StatefulSet"},
+	"kubernetes_daemonset":            {"apps/v1", "DaemonSet"},
+	"kubernetes_daemon_set":           {"apps/v1", "DaemonSet"},
+	"kubernetes_daemon_set_v1":        {"apps/v1", "DaemonSet"},
+	"kubernetes_pod":                  {"v1", "Pod"},
+	"kubernetes_pod_v1":               {"v1", "Pod"},
+	"kubernetes_service":              {"v1", "Service"},
+	"kubernetes_service_v1":           {"v1", "Service"},
+	"kubernetes_config_map":           {"v1", "ConfigMap"},
+	"kubernetes_config_map_v1":        {"v1", "ConfigMap"},
+	"kubernetes_secret":               {"v1", "Secret"},
+	"kubernetes_secret_v1":            {"v1", "Secret"},
+	"kubernetes_namespace":            {"v1", "Namespace"},
+	"kubernetes_namespace_v1":         {"v1", "Namespace"},
+	"kubernetes_service_account":      {"v1", "ServiceAccount"},
+	"kubernetes_service_account_v1":   {"v1", "ServiceAccount"},
+	"kubernetes_job":                  {"batch/v1", "Job"},
+	"kubernetes_job_v1":               {"batch/v1", "Job"},
+	"kubernetes_cron_job":             {"batch/v1", "CronJob"},
+	"kubernetes_cron_job_v1":          {"batch/v1", "CronJob"},
+	"kubernetes_ingress":              {"networking.k8s.io/v1beta1", "Ingress"},
+	"kubernetes_ingress_v1":           {"networking.k8s.io/v1", "Ingress"},
+	"kubernetes_network_policy":       {"networking.k8s.io/v1", "NetworkPolicy"},
+	"kubernetes_network_policy_v1":    {"networking.k8s.io/v1", "NetworkPolicy"},
+	"kubernetes_role":                 {"rbac.authorization.k8s.io/v1", "Role"},
+	"kubernetes_role_binding":         {"rbac.authorization.k8s.io/v1", "RoleBinding"},
+	"kubernetes_cluster_role":         {"rbac.authorization.k8s.io/v1", "ClusterRole"},
+	"kubernetes_cluster_role_binding": {"rbac.authorization.k8s.io/v1", "ClusterRoleBinding"},
+
+	"kubernetes_role_v1":                 {"rbac.authorization.k8s.io/v1", "Role"},
+	"kubernetes_role_binding_v1":         {"rbac.authorization.k8s.io/v1", "RoleBinding"},
+	"kubernetes_cluster_role_v1":         {"rbac.authorization.k8s.io/v1", "ClusterRole"},
+	"kubernetes_cluster_role_binding_v1": {"rbac.authorization.k8s.io/v1", "ClusterRoleBinding"},
+}
+
+// pluralOverrides maps an HCL block label to the K8s array field name it must
+// become, for the cases where camelCasing the block name alone isn't right
+// (block "container" -> field "containers"). Anything not listed here just
+// gets its singular name camelCased.
+var pluralOverrides = map[string]string{
+	"container":             "containers",
+	"init_container":        "initContainers",
+	"volume":                "volumes",
+	"volume_mount":          "volumeMounts",
+	"env_from":              "envFrom",
+	"port":                  "ports",
+	"toleration":            "tolerations",
+	"host_alias":            "hostAliases",
+	"rule":                  "rules",
+	"path":                  "paths",
+	"subject":               "subjects",
+	"image_pull_secrets":    "imagePullSecrets",
+	"match_expressions":     "matchExpressions",
+	"volume_claim_template": "volumeClaimTemplates",
+	"http_header":           "httpHeaders",
+	"sysctl":                "sysctls",
+}
+
+// repeatableBlocks lists HCL block labels that always encode as a JSON array,
+// even when only one instance is present — Terraform lets you repeat a block,
+// but the K8s field underneath (e.g. spec.containers) is always a list.
+var repeatableBlocks = map[string]bool{
+	"container": true, "init_container": true, "volume": true, "volume_mount": true,
+	"env": true, "env_from": true, "port": true, "ports": true, "toleration": true,
+	"host_alias": true, "rule": true, "subject": true, "image_pull_secrets": true,
+	"match_expressions": true, "volume_claim_template": true, "http_header": true,
+	"sysctl": true, "ingress": true, "egress": true, "from": true, "to": true,
+	"path": true, "tls": true,
+}
+
+// resourceMetaAttributes are Terraform meta-argument attributes valid on any
+// resource block (they configure Terraform itself, not the K8s object).
+// depends_on and provider in particular reference other resources/providers
+// that the var-only evalCtx can never resolve, so they must be stripped
+// before expression evaluation rather than left to fail into errs.
+var resourceMetaAttributes = map[string]bool{
+	"depends_on": true,
+	"provider":   true,
+	"count":      true,
+	"for_each":   true,
+}
+
+// resourceMetaBlocks are Terraform meta-argument blocks valid on any resource
+// block, stripped for the same reason. This is applied ONLY at the resource's
+// top level — a nested "lifecycle" block (e.g. a container's postStart/
+// preStop hooks) is a legitimate K8s field and must still be converted.
+var resourceMetaBlocks = map[string]bool{
+	"lifecycle":   true,
+	"provisioner": true,
+	"connection":  true,
+}
+
+var fieldInitialisms = map[string]string{
+	"api":  "API",
+	"id":   "ID",
+	"ip":   "IP",
+	"ipc":  "IPC",
+	"ips":  "IPs",
+	"pid":  "PID",
+	"uri":  "URI",
+	"urls": "URLs",
+	"uuid": "UUID",
+}
+
+func snakeToCamel(s string) string {
+	parts := strings.Split(s, "_")
+	for i := 1; i < len(parts); i++ {
+		if parts[i] == "" {
+			continue
+		}
+		if initialism, ok := fieldInitialisms[parts[i]]; ok {
+			parts[i] = initialism
+			continue
+		}
+		parts[i] = strings.ToUpper(parts[i][:1]) + parts[i][1:]
+	}
+	return strings.Join(parts, "")
+}
+
+func fieldNameFor(blockType string) string {
+	if v, ok := pluralOverrides[blockType]; ok {
+		return v
+	}
+	return snakeToCamel(blockType)
+}
+
+func attributeNameFor(name string) string {
+	return snakeToCamel(name)
+}
+
+func isDigitOnly(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func canonicalizeNumericString(s string) string {
+	trimmed := strings.TrimLeft(s, "0")
+	if trimmed == "" {
+		return "0"
+	}
+	return trimmed
+}
+
+func isNetworkPolicyPortField(path, name string) bool {
+	if name != "port" && name != "end_port" {
+		return false
+	}
+	if !strings.HasSuffix(path, ".ports") && path != "ports" {
+		return false
+	}
+	// If path includes a resource type, ensure it is NetworkPolicy.
+	if strings.Contains(path, "kubernetes_") && !strings.HasPrefix(path, "kubernetes_network_policy") {
+		return false
+	}
+	return true
+}
+
+func isLegacyIngressBackendPortField(path, name string) bool {
+	if name != "service_port" {
+		return false
+	}
+	if !strings.HasSuffix(path, ".backend") && path != "backend" {
+		return false
+	}
+	// Only kubernetes_ingress (legacy v1beta1), not kubernetes_ingress_v1.
+	if strings.Contains(path, "kubernetes_") && (!strings.HasPrefix(path, "kubernetes_ingress") || strings.HasPrefix(path, "kubernetes_ingress_v1")) {
+		return false
+	}
+	return true
+}
+
+func isIngressBackendServicePortNumberField(path, name string) bool {
+	if name != "number" {
+		return false
+	}
+	if !strings.HasSuffix(path, "backend.service.port") {
+		return false
+	}
+	if strings.Contains(path, "kubernetes_") && !strings.Contains(path, "kubernetes_ingress") {
+		return false
+	}
+	return true
+}
+
+func isBackendServicePortBlock(path, blockType string) bool {
+	if blockType != "port" {
+		return false
+	}
+	if !strings.HasSuffix(path, "backend.service") {
+		return false
+	}
+	if strings.Contains(path, "kubernetes_") && !strings.Contains(path, "kubernetes_ingress") {
+		return false
+	}
+	return true
+}
+
+func isConvertiblePortField(path, name string) bool {
+	return isNetworkPolicyPortField(path, name) || isLegacyIngressBackendPortField(path, name) || isIngressBackendServicePortNumberField(path, name)
+}
+
+// isServiceTargetPortField reports whether name is a Service port's
+// target_port. The provider declares it as a string and turns it into a number
+// or a name with intstr.Parse when it builds the Service.
+func isServiceTargetPortField(path, name string) bool {
+	if name != "target_port" {
+		return false
+	}
+	if !strings.HasSuffix(path, ".port") && path != "port" {
+		return false
+	}
+	if strings.Contains(path, "kubernetes_") && !strings.HasPrefix(path, "kubernetes_service") {
+		return false
+	}
+	return true
+}
+
+// isHandlerPortField reports whether name is the port of an http_get or
+// tcp_socket handler, as used by container probes and lifecycle hooks. Like
+// target_port, the provider declares it as a string and parses it with
+// intstr.Parse.
+func isHandlerPortField(path, name string) bool {
+	if name != "port" {
+		return false
+	}
+	return strings.HasSuffix(path, ".http_get") || strings.HasSuffix(path, ".tcp_socket") ||
+		path == "http_get" || path == "tcp_socket"
+}
+
+// isSecurityContextIDField reports whether name is a user or group ID in a pod
+// or container security_context. The provider declares these as strings, so
+// that 0 can be told apart from unset, and parses them with strconv.ParseInt;
+// terraform show and imported configurations write them quoted.
+func isSecurityContextIDField(path, name string) bool {
+	switch name {
+	case "run_as_user", "run_as_group", "fs_group":
+		return strings.HasSuffix(path, ".security_context") || path == "security_context"
+	}
+	return false
+}
+
+// isStringTypedNumberField covers the provider's string-typed fields that hold
+// a number: int-or-string ports, where a value made of digits only is a port
+// number and anything else a port name, as intstr.Parse reads it, and the
+// security context IDs.
+func isStringTypedNumberField(path, name string) bool {
+	return isServiceTargetPortField(path, name) || isHandlerPortField(path, name) || isSecurityContextIDField(path, name)
+}
+
+func attributeValueFor(path, name string, val interface{}) interface{} {
+	if s, ok := val.(string); ok && (isConvertiblePortField(path, name) || isStringTypedNumberField(path, name)) && isDigitOnly(s) {
+		return json.Number(canonicalizeNumericString(s))
+	}
+	return val
+}
+
+// hclBodyToMap walks a raw hclsyntax.Body — no schema declaration needed —
+// and converts it into a plain map[string]interface{}, applying the
+// terraform-provider-kubernetes snake_case -> camelCase convention and known
+// block pluralization so the result matches K8s JSON shape. Unresolved
+// attribute expressions are recorded in errs and left unset rather than
+// guessed at, matching the kubernetes_manifest policy.
+func hclBodyToMap(body *hclsyntax.Body, evalCtx *hcl.EvalContext, errs *[]error, path string) map[string]interface{} {
+	out := map[string]interface{}{}
+
+	for name, attr := range body.Attributes {
+		val, diags := attr.Expr.Value(evalCtx)
+		if diags.HasErrors() {
+			*errs = append(*errs, fmt.Errorf("%s: attribute %q: %w", path, name, diags))
+			continue
+		}
+		out[attributeNameFor(name)] = attributeValueFor(path, name, ctyToGo(val))
+	}
+
+	grouped := map[string][]*hclsyntax.Block{}
+	var order []string
+	for _, b := range body.Blocks {
+		if _, seen := grouped[b.Type]; !seen {
+			order = append(order, b.Type)
+		}
+		grouped[b.Type] = append(grouped[b.Type], b)
+	}
+
+	for _, blockType := range order {
+		blocks := grouped[blockType]
+		if isBackendServicePortBlock(path, blockType) {
+			out["port"] = hclBodyToMap(blocks[0].Body, evalCtx, errs, path+"."+blockType)
+			continue
+		}
+		field := fieldNameFor(blockType)
+
+		if len(blocks) > 1 || repeatableBlocks[blockType] {
+			var arr []interface{}
+			for _, b := range blocks {
+				arr = append(arr, hclBodyToMap(b.Body, evalCtx, errs, path+"."+blockType))
+			}
+			out[field] = arr
+			continue
+		}
+		out[field] = hclBodyToMap(blocks[0].Body, evalCtx, errs, path+"."+blockType)
+	}
+
+	if strings.HasSuffix(path, ".path") && strings.HasPrefix(path, "kubernetes_ingress_v1") {
+		if pt, has := out["pathType"]; !has || pt == nil {
+			out["pathType"] = "ImplementationSpecific"
+		}
+	}
+
+	return out
+}
+
+// hclResourceBodyToMap converts the top-level body of a resource block. It
+// strips Terraform meta-arguments (depends_on, provider, count, for_each,
+// lifecycle, provisioner, connection) before delegating each remaining
+// attribute/block to the same conversion hclBodyToMap uses, so nested
+// Kubernetes fields with the same names (e.g. a container's own "lifecycle"
+// block) are unaffected.
+func hclResourceBodyToMap(body *hclsyntax.Body, evalCtx *hcl.EvalContext, errs *[]error, path string) map[string]interface{} {
+	out := map[string]interface{}{}
+
+	for name, attr := range body.Attributes {
+		if resourceMetaAttributes[name] {
+			continue
+		}
+		val, diags := attr.Expr.Value(evalCtx)
+		if diags.HasErrors() {
+			*errs = append(*errs, fmt.Errorf("%s: attribute %q: %w", path, name, diags))
+			continue
+		}
+		out[attributeNameFor(name)] = attributeValueFor(path, name, ctyToGo(val))
+	}
+
+	grouped := map[string][]*hclsyntax.Block{}
+	var order []string
+	for _, b := range body.Blocks {
+		if resourceMetaBlocks[b.Type] {
+			continue
+		}
+		if _, seen := grouped[b.Type]; !seen {
+			order = append(order, b.Type)
+		}
+		grouped[b.Type] = append(grouped[b.Type], b)
+	}
+
+	for _, blockType := range order {
+		blocks := grouped[blockType]
+		field := fieldNameFor(blockType)
+
+		if len(blocks) > 1 || repeatableBlocks[blockType] {
+			var arr []interface{}
+			for _, b := range blocks {
+				arr = append(arr, hclBodyToMap(b.Body, evalCtx, errs, path+"."+blockType))
+			}
+			out[field] = arr
+			continue
+		}
+		out[field] = hclBodyToMap(blocks[0].Body, evalCtx, errs, path+"."+blockType)
+	}
+
+	return out
+}
+
+// extractTypedResources finds resource "kubernetes_<type>" "name" { ... }
+// blocks for the typed provider resources listed in typedResourceGVK and
+// converts each into a K8s manifest map. Resource types with no entry in the
+// table are left alone (not guessed at); a metadata.name is defaulted from
+// the Terraform resource label when the block doesn't set one explicitly.
+func extractTypedResources(body hcl.Body, evalCtx *hcl.EvalContext) ([]map[string]interface{}, []error) {
+	synBody, ok := body.(*hclsyntax.Body)
+	if !ok {
+		return nil, nil
+	}
+	var errs []error
+	var manifests []map[string]interface{}
+
+	for _, block := range synBody.Blocks {
+		if block.Type != "resource" || len(block.Labels) < 2 {
+			continue
+		}
+		gvk, supported := typedResourceGVK[block.Labels[0]]
+		if !supported {
+			continue
+		}
+
+		obj := hclResourceBodyToMap(block.Body, evalCtx, &errs, block.Labels[0]+"."+block.Labels[1])
+		obj["apiVersion"] = gvk.apiVersion
+		obj["kind"] = gvk.kind
+
+		meta, _ := obj["metadata"].(map[string]interface{})
+		if meta == nil {
+			meta = map[string]interface{}{}
+		}
+		if _, has := meta["name"]; !has {
+			meta["name"] = block.Labels[1]
+		}
+		obj["metadata"] = meta
+
+		manifests = append(manifests, obj)
+	}
+	return manifests, errs
+}

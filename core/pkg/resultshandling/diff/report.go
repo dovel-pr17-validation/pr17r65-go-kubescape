@@ -1,0 +1,515 @@
+package diff
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
+	"syscall"
+
+	"github.com/armosec/armoapi-go/armotypes"
+	"github.com/kubescape/opa-utils/exceptions"
+	"github.com/kubescape/opa-utils/reporthandling/apis"
+	helpersv1 "github.com/kubescape/opa-utils/reporthandling/helpers/v1"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/resourcesresults"
+)
+
+// These intentionally small report types parse only fields that affect diff
+// identity, severity, scope, and evaluation completeness. Unknown fields from
+// newer Kubescape versions remain forward compatible.
+type scanReport struct {
+	Results        []resultEntry  `json:"results"`
+	SummaryDetails summaryDetails `json:"summaryDetails"`
+	Metadata       reportMetadata `json:"metadata,omitempty"`
+	ScanCoverage   scanCoverage   `json:"scanCoverage,omitempty"`
+}
+
+type resultEntry struct {
+	ResourceID         string         `json:"resourceID"`
+	AssociatedControls []controlEntry `json:"controls"`
+}
+
+type controlEntry struct {
+	ControlID string      `json:"controlID"`
+	Name      string      `json:"name"`
+	Status    statusInfo  `json:"status"`
+	Rules     []ruleEntry `json:"rules,omitempty"`
+}
+
+type statusInfo struct {
+	InnerStatus string `json:"status"`
+	SubStatus   string `json:"subStatus,omitempty"`
+}
+
+type ruleEntry struct {
+	Exception             []armotypes.PostureExceptionPolicy `json:"exception,omitempty"`
+	ControlConfigurations map[string][]string                `json:"controlConfigurations,omitempty"`
+	Name                  string                             `json:"name"`
+	Status                string                             `json:"status"`
+	SubStatus             string                             `json:"subStatus,omitempty"`
+	Paths                 []evidencePath                     `json:"paths,omitempty"`
+	RelatedResourcesIDs   []string                           `json:"relatedResourcesIDs,omitempty"`
+}
+
+type evidencePath struct {
+	ResourceID string  `json:"resourceID,omitempty"`
+	FailedPath string  `json:"failedPath,omitempty"`
+	ReviewPath string  `json:"reviewPath,omitempty"`
+	DeletePath string  `json:"deletePath,omitempty"`
+	FixPath    fixPath `json:"fixPath,omitempty"`
+	FixCommand string  `json:"fixCommand,omitempty"`
+}
+
+type fixPath struct {
+	Path  string          `json:"path,omitempty"`
+	Value json.RawMessage `json:"value,omitempty"`
+}
+
+type frameworkSummary struct {
+	Name     string                    `json:"name"`
+	Controls map[string]controlSummary `json:"controls"`
+}
+
+type summaryDetails struct {
+	Frameworks []frameworkSummary        `json:"frameworks,omitempty"`
+	Controls   map[string]controlSummary `json:"controls"`
+}
+
+type controlSummary struct {
+	ScoreFactor float32 `json:"scoreFactor"`
+	Severity    string  `json:"severity"`
+}
+
+type reportMetadata struct {
+	TargetMetadata contextMetadata `json:"targetMetadata,omitempty"`
+	ScanMetadata   scanMetadata    `json:"scanMetadata,omitempty"`
+}
+
+type contextMetadata struct {
+	Cluster *clusterContext `json:"clusterContextMetadata,omitempty"`
+	Repo    *repoContext    `json:"gitRepoContextMetadata,omitempty"`
+}
+
+type clusterContext struct {
+	ContextName string `json:"contextName,omitempty"`
+}
+
+type repoContext struct {
+	Provider  string `json:"provider,omitempty"`
+	Repo      string `json:"repo,omitempty"`
+	Owner     string `json:"owner,omitempty"`
+	RemoteURL string `json:"remoteURL,omitempty"`
+	Branch    string `json:"branch,omitempty"`
+}
+
+type scanMetadata struct {
+	TargetType         string   `json:"targetType,omitempty"`
+	ScanningTarget     *uint16  `json:"scanningTarget,omitempty"`
+	IncludeNamespaces  []string `json:"includeNamespaces,omitempty"`
+	ExcludedNamespaces []string `json:"excludedNamespaces,omitempty"`
+	TargetNames        []string `json:"targetNames,omitempty"`
+}
+
+type scanCoverage struct {
+	FailedGVRPulls       []failedGVRPull       `json:"failedGVRPulls,omitempty"`
+	PartialGVRPulls      []json.RawMessage     `json:"partialGVRPulls,omitempty"`
+	PolicyDegradations   []json.RawMessage     `json:"policyDegradations,omitempty"`
+	SkippedManifests     []json.RawMessage     `json:"skippedManifests,omitempty"`
+	NotEvaluatedControls []notEvaluatedControl `json:"notEvaluatedControls,omitempty"`
+	Degraded             bool                  `json:"degraded,omitempty"`
+}
+
+type failedGVRPull struct {
+	GVR      string   `json:"gvr"`
+	Controls []string `json:"controls,omitempty"`
+}
+
+type notEvaluatedControl struct {
+	ControlID string `json:"controlID"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// MaxReportSize bounds how many bytes of a report are read.
+const MaxReportSize = 64 << 20 // 64 MiB
+
+const maxReportSize = MaxReportSize
+
+var (
+	errReportNotRegular = errors.New("report is not a regular file")
+	errReportTooLarge   = errors.New("report is too large")
+)
+
+// openReport opens path for reading and rejects anything but a regular file.
+// O_NONBLOCK keeps opening a FIFO from waiting for a writer, and the check is
+// made on the opened descriptor so a path swapped afterwards cannot slip past.
+func openReport(path string) (*os.File, error) {
+	file, err := os.OpenFile(filepath.Clean(path), os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		file.Close()
+		return nil, fmt.Errorf("%w: %q", errReportNotRegular, path)
+	}
+	return file, nil
+}
+
+// readReport returns the contents of the report at path, reading at most
+// maxReportSize bytes so a file that grows while it is read stays bounded.
+func readReport(path string) ([]byte, error) {
+	file, err := openReport(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(io.LimitReader(file, maxReportSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxReportSize {
+		return nil, fmt.Errorf("%w: %q exceeds the %d byte limit", errReportTooLarge, path, int64(maxReportSize))
+	}
+	return data, nil
+}
+
+func loadReport(path string) (*scanReport, error) {
+	data, err := readReport(path)
+	if err != nil {
+		return nil, err
+	}
+	return parseReport(data)
+}
+
+// parseReport validates and parses the JSON bytes of one scan report. It is
+// the shared tail of loadReport and ComputeFromJSON, so a report held in memory
+// is held to exactly the checks a report file is.
+func parseReport(data []byte) (*scanReport, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, fmt.Errorf("invalid report: expected a JSON object")
+	}
+
+	var topLevel map[string]json.RawMessage
+	if err := json.Unmarshal(data, &topLevel); err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+	if topLevel == nil {
+		return nil, fmt.Errorf("invalid report: expected a JSON object")
+	}
+
+	summaryJSON, hasSummary := topLevel["summaryDetails"]
+	resultsJSON, exists := topLevel["results"]
+	if !exists {
+		if !hasSummary {
+			return nil, fmt.Errorf("invalid report: missing required results field; provide JSON output from kubescape scan")
+		}
+		// A scan in which no control matched any resource has no results, and
+		// its JSON output omits the key rather than writing an empty array.
+		resultsJSON = json.RawMessage("[]")
+	}
+	if isJSONNull(resultsJSON) {
+		return nil, fmt.Errorf("invalid report: results must be an array, not null")
+	}
+	if !hasSummary {
+		return nil, fmt.Errorf("invalid report: missing required summaryDetails field; provide JSON output from kubescape scan")
+	}
+	if isJSONNull(summaryJSON) {
+		return nil, fmt.Errorf("invalid report: summaryDetails must be an object, not null")
+	}
+
+	var report scanReport
+	if err := json.Unmarshal(resultsJSON, &report.Results); err != nil {
+		return nil, fmt.Errorf("invalid report results: %w", err)
+	}
+	if err := validateSummary(&report, summaryJSON); err != nil {
+		return nil, err
+	}
+	if metadataJSON, exists := topLevel["metadata"]; exists && !isJSONNull(metadataJSON) {
+		if err := json.Unmarshal(metadataJSON, &report.Metadata); err != nil {
+			return nil, fmt.Errorf("invalid report metadata: %w", err)
+		}
+	}
+	if coverageJSON, exists := topLevel["scanCoverage"]; exists && !isJSONNull(coverageJSON) {
+		if err := json.Unmarshal(coverageJSON, &report.ScanCoverage); err != nil {
+			return nil, fmt.Errorf("invalid report scanCoverage: %w", err)
+		}
+	}
+	if err := validateReport(&report); err != nil {
+		return nil, err
+	}
+	return &report, nil
+}
+
+func isJSONNull(raw json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
+func validateSummary(report *scanReport, summaryJSON json.RawMessage) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(summaryJSON, &fields); err != nil {
+		return fmt.Errorf("invalid report summaryDetails: %w", err)
+	}
+	if fields == nil {
+		return fmt.Errorf("invalid report: summaryDetails must be an object")
+	}
+	controlsJSON, exists := fields["controls"]
+	if !exists {
+		return fmt.Errorf("invalid report: summaryDetails is missing required controls field")
+	}
+	if isJSONNull(controlsJSON) {
+		return fmt.Errorf("invalid report: summaryDetails.controls must be an object, not null")
+	}
+	var controls map[string]controlSummary
+	if err := json.Unmarshal(controlsJSON, &controls); err != nil {
+		return fmt.Errorf("invalid report summaryDetails.controls: %w", err)
+	}
+	report.SummaryDetails.Controls = controls
+	if frameworksJSON, exists := fields["frameworks"]; exists {
+		if err := json.Unmarshal(frameworksJSON, &report.SummaryDetails.Frameworks); err != nil {
+			return fmt.Errorf("invalid report summaryDetails.frameworks: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateReport(report *scanReport) error {
+	seen := make(map[key]struct{})
+	for resultIndex, result := range report.Results {
+		if strings.TrimSpace(result.ResourceID) == "" {
+			return fmt.Errorf("invalid report: results[%d].resourceID is empty", resultIndex)
+		}
+		for controlIndex, control := range result.AssociatedControls {
+			if strings.TrimSpace(control.ControlID) == "" {
+				return fmt.Errorf("invalid report: results[%d].controls[%d].controlID is empty", resultIndex, controlIndex)
+			}
+			if strings.TrimSpace(control.Status.InnerStatus) == "" {
+				return fmt.Errorf("invalid report: results[%d].controls[%d].status.status is empty", resultIndex, controlIndex)
+			}
+			controlKey := key{resourceID: result.ResourceID, controlID: control.ControlID}
+			if _, exists := seen[controlKey]; exists {
+				return fmt.Errorf("invalid report: duplicate resource and control pair %q / %q", result.ResourceID, control.ControlID)
+			}
+			seen[controlKey] = struct{}{}
+			for ruleIndex, rule := range control.Rules {
+				if strings.TrimSpace(rule.Name) == "" {
+					return fmt.Errorf("invalid report: results[%d].controls[%d].rules[%d].name is empty", resultIndex, controlIndex, ruleIndex)
+				}
+				if strings.TrimSpace(rule.Status) == "" {
+					return fmt.Errorf("invalid report: results[%d].controls[%d].rules[%d].status is empty", resultIndex, controlIndex, ruleIndex)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func buildMap(report *scanReport) map[key]controlEntry {
+	controls := make(map[key]controlEntry)
+	for _, result := range report.Results {
+		for _, control := range result.AssociatedControls {
+			controls[key{resourceID: result.ResourceID, controlID: control.ControlID}] = effectiveControl(report, control)
+		}
+	}
+	return controls
+}
+
+// effectiveControl derives a comparison view without rewriting the parsed report.
+// Reports without rule details retain their cached status. Older reports that
+// discarded a raw failure cannot reconstruct that failure from exception data.
+func effectiveControl(report *scanReport, control controlEntry) controlEntry {
+	hasExceptions := false
+	for _, rule := range control.Rules {
+		hasExceptions = hasExceptions || len(rule.Exception) > 0
+	}
+	// Cached evaluation-completeness markers cannot be reconstructed from rules.
+	// Preserve legacy outcomes when no exception needs an effective view.
+	if !hasExceptions || control.Status.SubStatus == string(apis.SubStatusNotEvaluated) {
+		return control
+	}
+	if control.Status.InnerStatus != string(apis.StatusFailed) && control.Status.InnerStatus != string(apis.StatusPassed) {
+		switch apis.ScanningSubStatus(control.Status.SubStatus) {
+		case apis.SubStatusManualReview, apis.SubStatusRequiresReview, apis.SubStatusConfiguration:
+		default:
+			return control
+		}
+	}
+	filters := &helpersv1.Filters{}
+	for _, framework := range report.SummaryDetails.Frameworks {
+		if _, exists := framework.Controls[control.ControlID]; exists && framework.Name != "" {
+			filters.FrameworkNames = append(filters.FrameworkNames, framework.Name)
+		}
+	}
+	evaluation := resourcesresults.ResourceAssociatedControl{
+		ControlID: control.ControlID,
+		Status:    apis.StatusInfo{InnerStatus: apis.ScanningStatus(control.Status.InnerStatus), SubStatus: apis.ScanningSubStatus(control.Status.SubStatus)},
+	}
+	control.Rules = append([]ruleEntry(nil), control.Rules...)
+	for i, rule := range control.Rules {
+		evaluatedRule := resourcesresults.ResourceAssociatedRule{
+			Name: rule.Name, Status: apis.ScanningStatus(rule.Status), SubStatus: apis.ScanningSubStatus(rule.SubStatus),
+			ControlConfigurations: rule.ControlConfigurations,
+			Exception:             exceptions.FilterExceptionsByFrameworks(rule.Exception, filters.FrameworkNames, control.ControlID, rule.Name),
+		}
+		evaluation.ResourceAssociatedRules = append(evaluation.ResourceAssociatedRules, evaluatedRule)
+		status := evaluatedRule.GetStatus(filters)
+		control.Rules[i].Status = string(status.Status())
+		control.Rules[i].SubStatus = string(status.GetSubStatus())
+	}
+	status := evaluation.GetStatus(filters)
+	control.Status = statusInfo{InnerStatus: string(status.Status()), SubStatus: string(status.GetSubStatus())}
+	return control
+}
+
+func buildSeverityMap(report *scanReport) map[string]string {
+	severities := make(map[string]string, len(report.SummaryDetails.Controls))
+	for controlID, summary := range report.SummaryDetails.Controls {
+		severity := summary.Severity
+		if severity == "" {
+			severity = apis.ControlSeverityToString(summary.ScoreFactor)
+		}
+		severities[controlID] = severity
+	}
+	return severities
+}
+
+func incompatibleScopeReasons(base, head *scanReport) []string {
+	reasons := make([]string, 0)
+	baseScan, headScan := base.Metadata.ScanMetadata, head.Metadata.ScanMetadata
+	if differentNonEmpty(baseScan.TargetType, headScan.TargetType) {
+		reasons = append(reasons, fmt.Sprintf("scan target types differ: base=%q head=%q", baseScan.TargetType, headScan.TargetType))
+	}
+	if baseScan.ScanningTarget != nil && headScan.ScanningTarget != nil && *baseScan.ScanningTarget != *headScan.ScanningTarget {
+		reasons = append(reasons, fmt.Sprintf("scanning targets differ: base=%d head=%d", *baseScan.ScanningTarget, *headScan.ScanningTarget))
+	}
+	compareStringSet(&reasons, "included namespaces", baseScan.IncludeNamespaces, headScan.IncludeNamespaces)
+	compareStringSet(&reasons, "excluded namespaces", baseScan.ExcludedNamespaces, headScan.ExcludedNamespaces)
+	compareStringSet(&reasons, "target names", baseScan.TargetNames, headScan.TargetNames)
+
+	baseContext, headContext := base.Metadata.TargetMetadata, head.Metadata.TargetMetadata
+	if baseContext.Cluster != nil && headContext.Cluster != nil && differentNonEmpty(baseContext.Cluster.ContextName, headContext.Cluster.ContextName) {
+		reasons = append(reasons, fmt.Sprintf("cluster contexts differ: base=%q head=%q", baseContext.Cluster.ContextName, headContext.Cluster.ContextName))
+	}
+	if baseContext.Repo != nil && headContext.Repo != nil {
+		baseIdentity, headIdentity := repositoryIdentity(baseContext.Repo), repositoryIdentity(headContext.Repo)
+		if differentNonEmpty(baseIdentity, headIdentity) {
+			reasons = append(reasons, fmt.Sprintf("repository identities differ: base=%q head=%q", baseIdentity, headIdentity))
+		}
+	}
+	return reasons
+}
+
+func differentNonEmpty(left, right string) bool {
+	return strings.TrimSpace(left) != "" && strings.TrimSpace(right) != "" && strings.TrimSpace(left) != strings.TrimSpace(right)
+}
+
+func compareStringSet(reasons *[]string, label string, left, right []string) {
+	if len(left) == 0 && len(right) == 0 {
+		return
+	}
+	leftCanonical, rightCanonical := canonicalSet(left), canonicalSet(right)
+	if strings.Join(leftCanonical, "\x00") != strings.Join(rightCanonical, "\x00") {
+		*reasons = append(*reasons, fmt.Sprintf("%s differ: base=%v head=%v", label, leftCanonical, rightCanonical))
+	}
+}
+
+func canonicalSet(values []string) []string {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			set[trimmed] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(set))
+	for value := range set {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func repositoryIdentity(repo *repoContext) string {
+	if repo == nil {
+		return ""
+	}
+	if repo.Owner != "" || repo.Repo != "" {
+		return strings.Trim(strings.ToLower(strings.TrimSpace(repo.Provider)+"/"+strings.TrimSpace(repo.Owner)+"/"+strings.TrimSpace(repo.Repo)), "/")
+	}
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(repo.RemoteURL)), ".git")
+}
+
+func controlDefinitelyOutOfScope(report *scanReport, controlID string) bool {
+	return len(report.SummaryDetails.Controls) > 0 && !summaryContainsControl(report, controlID)
+}
+
+// ReasonBaseCoverageDegraded and ReasonHeadCoverageDegraded are the reasons a
+// failure is Incomparable when a gap in the base or the head report's scan
+// coverage could account for it (coverageGapAffects): the head failure may not
+// be new, or the base failure may not be resolved. Which gap it was, a policy
+// fallback or a resource type that was not read in full, the report's
+// scanCoverage says.
+const (
+	ReasonBaseCoverageDegraded = "base report has degraded scan coverage, so the head failure cannot be classified as new"
+	ReasonHeadCoverageDegraded = "head report has degraded scan coverage, so an absent failure is not a conclusive resolution"
+)
+
+func absentNewFailureRisk(report *scanReport, controlID string) string {
+	for _, control := range report.ScanCoverage.NotEvaluatedControls {
+		if control.ControlID == controlID {
+			return "control was not evaluated in the base report, so the head failure cannot be classified as new"
+		}
+	}
+	if coverageGapAffects(report.ScanCoverage, controlID) {
+		return ReasonBaseCoverageDegraded
+	}
+	return ""
+}
+
+// coverageGapAffects reports whether a gap in a report's scan coverage could
+// hide a failure of controlID. A failed GVR pull only affects the controls it
+// names; one that names none comes from an older report and may affect any
+// control. Partial pulls, policy fallbacks and skipped manifests may affect
+// any control, and so does a degraded bit with nothing recorded behind it.
+// A control that was not evaluated is checked by the callers.
+func coverageGapAffects(coverage scanCoverage, controlID string) bool {
+	if len(coverage.PartialGVRPulls) > 0 || len(coverage.PolicyDegradations) > 0 || len(coverage.SkippedManifests) > 0 {
+		return true
+	}
+	for _, pull := range coverage.FailedGVRPulls {
+		if len(pull.Controls) == 0 || slices.Contains(pull.Controls, controlID) {
+			return true
+		}
+	}
+	return coverage.Degraded && len(coverage.FailedGVRPulls) == 0 && len(coverage.NotEvaluatedControls) == 0
+}
+
+func summaryContainsControl(report *scanReport, controlID string) bool {
+	_, exists := report.SummaryDetails.Controls[controlID]
+	return exists
+}
+
+func absentResolutionRisk(report *scanReport, controlID string) string {
+	if controlDefinitelyOutOfScope(report, controlID) {
+		return "control is not present in the head report's declared control scope"
+	}
+	for _, control := range report.ScanCoverage.NotEvaluatedControls {
+		if control.ControlID == controlID {
+			return "control was not evaluated in the head report"
+		}
+	}
+	if coverageGapAffects(report.ScanCoverage, controlID) {
+		return ReasonHeadCoverageDegraded
+	}
+	return ""
+}

@@ -1,0 +1,259 @@
+package networkpolicy
+
+import (
+	"fmt"
+	"math"
+	"net"
+
+	"github.com/kubescape/kubescape/v4/core/pkg/namespaceselector"
+
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/intstr"
+)
+
+// safePort converts an int (from intstr.IntValue, which is always a plain
+// int regardless of platform width) to int32, reporting false instead of
+// silently wrapping when v falls outside int32's range.
+func safePort(v int) (int32, bool) {
+	if v < math.MinInt32 || v > math.MaxInt32 {
+		return 0, false
+	}
+	return int32(v), true
+}
+
+// corev1ProtocolOrDefault mirrors the Kubernetes API's own default: an
+// unset NetworkPolicyPort.Protocol means TCP.
+func corev1ProtocolOrDefault(p corev1.Protocol) corev1.Protocol {
+	if p == "" {
+		return corev1.ProtocolTCP
+	}
+	return p
+}
+
+// peerMatches reports whether one NetworkPolicyPeer selects candidate, given
+// the namespace the owning policy (and rule) lives in. The bool return is
+// the match result; the second return is false only when the peer's kind
+// cannot be evaluated at all from the data available (an ipBlock peer
+// against a candidate with no known IP, or a namespaceSelector against a
+// namespace this Index was never given labels for) -- in that case the
+// first return is meaningless and callers must treat this as Unknown, not
+// as a confident false. A candidate with several addresses is in that
+// position too when an ipBlock peer contains some of them but not others:
+// the answer then depends on which address the connection uses. Reaches
+// avoids this by narrowing a dual-stack pair to one IP family at a time.
+func (idx *Index) peerMatches(peer networkingv1.NetworkPolicyPeer, policyNamespace string, candidate Endpoint) (matched bool, determinable bool) {
+	if peer.IPBlock != nil {
+		addrs := candidate.addresses()
+		if len(addrs) == 0 {
+			return false, false
+		}
+		matches := 0
+		for _, ip := range addrs {
+			if ipBlockMatches(peer.IPBlock, ip) {
+				matches++
+			}
+		}
+		if matches != 0 && matches != len(addrs) {
+			return false, false
+		}
+		return matches != 0, true
+	}
+
+	switch {
+	case peer.NamespaceSelector != nil && peer.PodSelector != nil:
+		nsSel, err := metav1.LabelSelectorAsSelector(peer.NamespaceSelector)
+		if err != nil {
+			return false, true
+		}
+		podSel, err := metav1.LabelSelectorAsSelector(peer.PodSelector)
+		if err != nil {
+			return false, true
+		}
+		if !podSel.Matches(labels.Set(candidate.Labels)) {
+			return false, true // pod side already fails; namespace labels are moot
+		}
+		nsMatch, determinable := idx.namespaceSelectorMatches(nsSel, candidate.Namespace)
+		return nsMatch, determinable
+
+	case peer.NamespaceSelector != nil:
+		nsSel, err := metav1.LabelSelectorAsSelector(peer.NamespaceSelector)
+		if err != nil {
+			return false, true
+		}
+		return idx.namespaceSelectorMatches(nsSel, candidate.Namespace)
+
+	case peer.PodSelector != nil:
+		// A podSelector with no namespaceSelector only ever selects pods in
+		// the same namespace as the policy that declares it.
+		if candidate.Namespace != policyNamespace {
+			return false, true
+		}
+		podSel, err := metav1.LabelSelectorAsSelector(peer.PodSelector)
+		if err != nil {
+			return false, true
+		}
+		return podSel.Matches(labels.Set(candidate.Labels)), true
+
+	default:
+		// No selector or ipBlock at all. The API server rejects a peer like
+		// this, but a defensively-parsed object should not be treated as
+		// matching everything.
+		return false, true
+	}
+}
+
+// namespaceSelectorMatches evaluates nsSel against namespace's labels.
+// A selector that matches everything (nil or empty matchLabels/
+// matchExpressions) is determinable regardless of whether this Index was
+// given that namespace's labels, since the labels can't change the answer;
+// the immutable namespace-name label can be inferred from the endpoint.
+// Requirements on other labels still need a collected namespace.
+func (idx *Index) namespaceSelectorMatches(nsSel labels.Selector, namespace string) (matched bool, determinable bool) {
+	if idx == nil {
+		return false, false
+	}
+	nsInfo, collected := idx.namespaces[namespace]
+	return namespaceselector.Matches(nsSel, namespace, nsInfo.Labels, collected)
+}
+
+// ipBlockMatches reports whether ip falls inside block.CIDR and outside
+// every one of block.Except.
+func ipBlockMatches(block *networkingv1.IPBlock, ip string) bool {
+	if block.CIDR == "" {
+		return false
+	}
+	_, cidrNet, err := net.ParseCIDR(block.CIDR)
+	if err != nil {
+		return false
+	}
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return false
+	}
+	if !cidrNet.Contains(parsedIP) {
+		return false
+	}
+	for _, except := range block.Except {
+		_, exceptNet, err := net.ParseCIDR(except)
+		if err != nil {
+			continue
+		}
+		if exceptNet.Contains(parsedIP) {
+			return false
+		}
+	}
+	return true
+}
+
+// peerListVerdict OR-combines every peer in peers against candidate: an
+// empty/nil peer list matches everything (a rule with no from/to
+// restriction), matching Kubernetes' own semantics for an absent peer list.
+// selected is the endpoint the owning policy selects; it only matters for
+// how far a selector match on a hostNetwork candidate can be trusted.
+func (idx *Index) peerListVerdict(peers []networkingv1.NetworkPolicyPeer, policyNamespace string, selected, candidate Endpoint) (Verdict, string) {
+	if len(peers) == 0 {
+		return Allowed, "rule has no source/destination restriction"
+	}
+
+	sawUnknown, sawHostNetwork, sawSomeAddresses := false, false, false
+	for _, peer := range peers {
+		matched, determinable := idx.peerMatches(peer, policyNamespace, candidate)
+		if !determinable {
+			// An ipBlock peer is only undeterminable for a candidate with
+			// known addresses when it contains some of them (see peerMatches).
+			if peer.IPBlock != nil && len(candidate.addresses()) > 0 {
+				sawSomeAddresses = true
+			} else {
+				sawUnknown = true
+			}
+			continue
+		}
+		if matched && candidate.HostNetwork && !selected.HostNetwork && peer.IPBlock == nil {
+			// The labels match, but a plugin that cannot tell a hostNetwork
+			// pod's traffic from its node's ignores the pod when matching
+			// selectors (see Endpoint.HostNetwork). That only leaves the
+			// match in doubt while the policy itself is enforced: when the
+			// selected pod is on the host network too, such a plugin does
+			// not enforce the policy on it at all, so the connection is
+			// allowed whether the plugin honours this match or ignores both
+			// pods.
+			sawHostNetwork = true
+			continue
+		}
+		if matched {
+			return Allowed, "matched a peer in this rule"
+		}
+	}
+	if sawHostNetwork {
+		return Unknown, "a peer in this rule selects the pod by its labels, but the pod uses the host network"
+	}
+	if sawUnknown {
+		return Unknown, "a peer in this rule could not be resolved (unknown IP or namespace labels)"
+	}
+	if sawSomeAddresses {
+		return Unknown, "an ipBlock peer in this rule contains some of the pod's addresses but not all, and which of them the connection uses could not be resolved"
+	}
+	return Denied, "no peer in this rule matched"
+}
+
+// portVerdict reports whether ports allows query. An empty/nil port list
+// matches every port, matching Kubernetes' own semantics for an absent port
+// list. A rule entry with a named (string) container port cannot be
+// resolved without that container's port-name mapping, which this static,
+// container-spec-free model does not have, so it reports Unknown rather
+// than silently skipping or guessing.
+func portVerdict(ports []networkingv1.NetworkPolicyPort, query *PortSpec) (Verdict, string) {
+	if len(ports) == 0 {
+		return Allowed, "rule has no port restriction"
+	}
+	if query == nil {
+		// Direction-only queries may ignore ports. Reaches handles an
+		// omitted port separately, checking concrete port/protocol pairs
+		// so both directions must permit the same connection.
+		return Allowed, "no specific port was queried; rule's port restriction does not apply"
+	}
+
+	sawUnknown := false
+	for _, p := range ports {
+		var protoVal corev1.Protocol
+		if p.Protocol != nil {
+			protoVal = *p.Protocol
+		}
+		proto := corev1ProtocolOrDefault(protoVal)
+		if proto != query.protocol() {
+			continue
+		}
+		if p.Port == nil {
+			// No port specified alongside a protocol restriction: matches
+			// every port of that protocol.
+			return Allowed, fmt.Sprintf("matched protocol %s with no port restriction", proto)
+		}
+		if p.Port.Type == intstr.String {
+			sawUnknown = true
+			continue
+		}
+		lo, ok := safePort(p.Port.IntValue())
+		if !ok {
+			// A scan can read a NetworkPolicy straight from a manifest that
+			// was never actually applied (and so never validated by the
+			// API server), so a port outside 0-65535 is a real possibility
+			// here, not just a defensive check. Such an entry can never
+			// match a real port, rather than wrapping into a bogus value.
+			continue
+		}
+		hi := lo
+		if p.EndPort != nil {
+			hi = *p.EndPort
+		}
+		if query.Port >= lo && query.Port <= hi {
+			return Allowed, fmt.Sprintf("matched port %d/%s", query.Port, proto)
+		}
+	}
+	if sawUnknown {
+		return Unknown, "rule includes a named (string) container port this model cannot resolve"
+	}
+	return Denied, "no port entry in this rule matched"
+}

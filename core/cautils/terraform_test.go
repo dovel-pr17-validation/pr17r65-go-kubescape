@@ -1,0 +1,423 @@
+package cautils
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/kubescape/k8s-interface/workloadinterface"
+	"github.com/kubescape/kubescape/v4/core/pkg/pathcontainment"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestTerraformDirectory_GetWorkloads_MapsSysctls(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.tf")
+	require.NoError(t, os.WriteFile(path, []byte(`
+resource "kubernetes_pod_v1" "example" {
+  metadata {
+    name      = "sysctl-test"
+    namespace = "default"
+  }
+  spec {
+    security_context {
+      sysctl {
+        name  = "net.ipv4.ip_local_port_range"
+        value = "1024 65535"
+      }
+    }
+    container {
+      name  = "pause"
+      image = "registry.k8s.io/pause:3.9"
+    }
+  }
+}
+`), 0o600))
+
+	workloads, errs := NewTerraformDirectory(dir).GetWorkloads(dir)
+	require.Empty(t, errs)
+	require.Len(t, workloads[path], 1)
+
+	obj := workloads[path][0].GetObject()
+	spec := obj["spec"].(map[string]interface{})
+	securityContext := spec["securityContext"].(map[string]interface{})
+	assert.NotContains(t, securityContext, "sysctl")
+	sysctls, ok := securityContext["sysctls"].([]interface{})
+	require.True(t, ok, "securityContext.sysctls must be an array")
+	require.Len(t, sysctls, 1)
+	assert.Equal(t, "net.ipv4.ip_local_port_range", sysctls[0].(map[string]interface{})["name"])
+}
+
+func TestTerraformDirectory_GetWorkloads_NetworkPolicyAndIngress(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.tf")
+	require.NoError(t, os.WriteFile(path, []byte(`
+resource "kubernetes_network_policy_v1" "np" {
+  metadata {
+    name      = "test-np"
+    namespace = "default"
+  }
+  spec {
+    pod_selector {
+      match_labels = {
+        app = "backend"
+      }
+    }
+    policy_types = ["Ingress"]
+    ingress {
+      ports {
+        port     = 8080
+        protocol = "TCP"
+      }
+    }
+  }
+}
+
+resource "kubernetes_ingress_v1" "ing" {
+  metadata {
+    name      = "test-ing"
+    namespace = "default"
+  }
+  spec {
+    tls {
+      hosts = ["example.com"]
+    }
+    rule {
+      host = "example.com"
+      http {
+        path {
+          path      = "/api"
+          path_type = "Prefix"
+          backend {
+            service {
+              name = "backend-service"
+              port {
+                number = 8080
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+`), 0o600))
+
+	workloads, errs := NewTerraformDirectory(dir).GetWorkloads(dir)
+	require.Empty(t, errs)
+	require.Len(t, workloads[path], 2)
+
+	kinds := []string{workloads[path][0].GetKind(), workloads[path][1].GetKind()}
+	assert.Contains(t, kinds, "NetworkPolicy")
+	assert.Contains(t, kinds, "Ingress")
+}
+
+func TestTerraformDirectory_GetWorkloads(t *testing.T) {
+	td := NewTerraformDirectory("testdata/terraform")
+	workloads, errs := td.GetWorkloads("testdata/terraform")
+	require.Empty(t, errs)
+	require.Contains(t, workloads, "testdata/terraform/main.tf")
+
+	wls := workloads["testdata/terraform/main.tf"]
+	require.Len(t, wls, 1)
+	assert.Equal(t, "Deployment", wls[0].GetKind())
+	assert.Equal(t, "nginx", wls[0].GetName())
+	assert.Equal(t, "default", wls[0].GetNamespace())
+}
+
+func TestTerraformDirectory_GetWorkloads_TypedResource_MetaArgsAndNestedArrays(t *testing.T) {
+	td := NewTerraformDirectory("testdata/terraform_typed_meta")
+	workloads, errs := td.GetWorkloads("testdata/terraform_typed_meta")
+	require.Empty(t, errs)
+
+	wls := workloads["testdata/terraform_typed_meta/main.tf"]
+	var sts workloadinterface.IMetadata
+	for _, w := range wls {
+		if w.GetKind() == "StatefulSet" {
+			sts = w
+		}
+	}
+	require.NotNil(t, sts, "expected a StatefulSet workload")
+	assert.Equal(t, "web", sts.GetName())
+
+	obj := sts.GetObject()
+
+	assert.NotContains(t, obj, "dependsOn")
+	assert.NotContains(t, obj, "count")
+	assert.NotContains(t, obj, "provider")
+	assert.NotContains(t, obj, "lifecycle")
+
+	spec := obj["spec"].(map[string]interface{})
+
+	selector := spec["selector"].(map[string]interface{})
+	matchExprs, ok := selector["matchExpressions"].([]interface{})
+	require.True(t, ok, "expected selector.matchExpressions to be an array")
+	require.Len(t, matchExprs, 1)
+	assert.Equal(t, "app", matchExprs[0].(map[string]interface{})["key"])
+
+	vcts, ok := spec["volumeClaimTemplates"].([]interface{})
+	require.True(t, ok, "expected spec.volumeClaimTemplates to be an array")
+	require.Len(t, vcts, 1)
+
+	tmplSpec := spec["template"].(map[string]interface{})["spec"].(map[string]interface{})
+	containers := tmplSpec["containers"].([]interface{})
+	require.Len(t, containers, 1)
+	c := containers[0].(map[string]interface{})
+	httpGet := c["readinessProbe"].(map[string]interface{})["httpGet"].(map[string]interface{})
+	headers, ok := httpGet["httpHeaders"].([]interface{})
+	require.True(t, ok, "expected httpGet.httpHeaders to be an array")
+	require.Len(t, headers, 1)
+	assert.Equal(t, "X-Custom-Header", headers[0].(map[string]interface{})["name"])
+}
+
+func TestIsTerraformFile(t *testing.T) {
+	assert.True(t, IsTerraformFile("main.tf"))
+	assert.False(t, IsTerraformFile("main.yaml"))
+}
+
+func TestTerraformDirectory_GetWorkloads_TypedResource(t *testing.T) {
+	td := NewTerraformDirectory("testdata/terraform_typed")
+	workloads, errs := td.GetWorkloads("testdata/terraform_typed")
+	require.Empty(t, errs)
+	require.Contains(t, workloads, "testdata/terraform_typed/main.tf")
+
+	wls := workloads["testdata/terraform_typed/main.tf"]
+	require.Len(t, wls, 1)
+	assert.Equal(t, "Deployment", wls[0].GetKind())
+	assert.Equal(t, "nginx-typed", wls[0].GetName())
+	assert.Equal(t, "default", wls[0].GetNamespace())
+
+	obj := wls[0].GetObject()
+	spec, ok := obj["spec"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "2", fmt.Sprintf("%v", spec["replicas"]))
+
+	tmplSpec := spec["template"].(map[string]interface{})["spec"].(map[string]interface{})
+	containers, ok := tmplSpec["containers"].([]interface{})
+	require.True(t, ok)
+	require.Len(t, containers, 1)
+	c := containers[0].(map[string]interface{})
+	assert.Equal(t, "nginx", c["name"])
+	assert.Equal(t, "nginx:1.25", c["image"])
+
+	ports, ok := c["ports"].([]interface{})
+	require.True(t, ok)
+	require.Len(t, ports, 1)
+	assert.Equal(t, "80", fmt.Sprintf("%v", ports[0].(map[string]interface{})["containerPort"]))
+}
+func TestTerraformDirectory_GetWorkloads_PreservesLargeIntegerPrecision(t *testing.T) {
+	td := NewTerraformDirectory("testdata/terraform_bignum")
+	workloads, errs := td.GetWorkloads("testdata/terraform_bignum")
+	require.Empty(t, errs)
+	require.NotEmpty(t, workloads)
+
+	var found bool
+	for _, wls := range workloads {
+		for _, w := range wls {
+			obj := w.GetObject()
+			meta, ok := obj["metadata"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if v, ok := meta["generation"]; ok {
+				assert.Equal(t, "9007199254740993", fmt.Sprintf("%v", v))
+				found = true
+			}
+		}
+	}
+	assert.True(t, found, "expected to find the big-number annotation in scanned output")
+}
+
+func TestTerraformDirectory_WorkspaceContainment(t *testing.T) {
+	ws := t.TempDir()
+	insideDir := filepath.Join(ws, "inside")
+	require.NoError(t, os.Mkdir(insideDir, 0o755))
+	insideFile := filepath.Join(insideDir, "main.tf")
+	require.NoError(t, os.WriteFile(insideFile, []byte(`
+variable "pod_name" {
+  default = "inside-pod"
+}
+
+resource "kubernetes_pod_v1" "example" {
+  metadata {
+    name = var.pod_name
+  }
+  spec {
+    container {
+      name  = "pause"
+      image = "registry.k8s.io/pause:3.9"
+    }
+  }
+}
+`), 0o600))
+
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, "outside.tf")
+	require.NoError(t, os.WriteFile(outsideFile, []byte(`
+variable "pod_name" {
+  default = "outside-override-pod"
+}
+
+resource "kubernetes_pod_v1" "outside" {
+  metadata {
+    name = "outside-pod"
+  }
+  spec {
+    container {
+      name  = "pause"
+      image = "registry.k8s.io/pause:3.9"
+    }
+  }
+}
+`), 0o600))
+
+	td := NewTerraformDirectory(insideDir, ws)
+	workloads, errs := td.GetWorkloads(insideDir)
+	require.Empty(t, errs)
+	require.Len(t, workloads[insideFile], 1)
+	assert.Equal(t, "inside-pod", workloads[insideFile][0].GetName())
+
+	symlinkPath := filepath.Join(insideDir, "symlink.tf")
+	if err := os.Symlink(outsideFile, symlinkPath); err == nil {
+		workloads, errs = td.GetWorkloads(insideDir)
+		require.Empty(t, errs)
+		require.Len(t, workloads[insideFile], 1)
+		assert.Equal(t, "inside-pod", workloads[insideFile][0].GetName())
+		assert.NotContains(t, workloads, symlinkPath)
+	}
+
+	_, err := LoadResourcesFromTerraformFiltered(context.Background(), outsideDir, nil, ws)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, pathcontainment.ErrPathEscapesWorkspace)
+}
+
+func TestReadTerraformFile_OversizedFileRejected(t *testing.T) {
+	t.Setenv(MaxFileSizeEnvVar, "") // empty falls back to DefaultMaxFileSize
+
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "oversized.tf")
+	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	require.NoError(t, f.Truncate(maxTerraformFileBytes+1))
+	require.NoError(t, f.Close())
+
+	_, err = readTerraformFile(filePath)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrTerraformFileTooLarge)
+}
+
+func TestReadTerraformFile_NonRegularFileRejected(t *testing.T) {
+	if _, err := os.Stat("/dev/null"); err == nil {
+		_, err := readTerraformFile("/dev/null")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrTerraformFileNotRegular)
+	}
+}
+
+func TestReadTerraformFile_DirectoryRejected(t *testing.T) {
+	dir := t.TempDir()
+	_, err := readTerraformFile(dir)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrTerraformFileNotRegular)
+	assert.Contains(t, err.Error(), "is a directory, not a file")
+}
+
+func TestTerraformDirectory_GetWorkloads_OversizedFileRejected(t *testing.T) {
+	t.Setenv(MaxFileSizeEnvVar, "") // empty falls back to DefaultMaxFileSize
+
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "oversized.tf")
+	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	require.NoError(t, f.Truncate(maxTerraformFileBytes+1))
+	require.NoError(t, f.Close())
+
+	td := NewTerraformDirectory(dir)
+	_, errs := td.GetWorkloads(dir)
+	require.NotEmpty(t, errs)
+	found := false
+	for _, e := range errs {
+		if errors.Is(e, ErrTerraformFileTooLarge) {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected ErrTerraformFileTooLarge in errs: %v", errs)
+}
+
+func TestTerraformDirectory_GetWorkloads_NonRegularFileRejected(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := os.Stat("/dev/null"); err == nil {
+		target := filepath.Join(dir, "dev_null.tf")
+		if err := os.Symlink("/dev/null", target); err == nil {
+			td := NewTerraformDirectory(dir)
+			_, errs := td.GetWorkloads(dir)
+			require.NotEmpty(t, errs)
+			found := false
+			for _, e := range errs {
+				if errors.Is(e, ErrTerraformFileNotRegular) {
+					found = true
+					break
+				}
+			}
+			assert.True(t, found, "expected ErrTerraformFileNotRegular in errs: %v", errs)
+		}
+	}
+}
+
+func TestTerraformDirectory_GetWorkloads_DirectoryRejected(t *testing.T) {
+	dir := t.TempDir()
+	subDir := filepath.Join(dir, "sub.tf")
+	require.NoError(t, os.Mkdir(subDir, 0o755))
+
+	td := NewTerraformDirectory(dir)
+	_, errs := td.GetWorkloads(dir)
+	require.NotEmpty(t, errs)
+	found := false
+	for _, e := range errs {
+		if errors.Is(e, ErrTerraformFileNotRegular) {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected ErrTerraformFileNotRegular in errs: %v", errs)
+}
+
+func TestReadTerraformFile_MaxFileSizeEnvVar_LowerOverride(t *testing.T) {
+	t.Setenv(MaxFileSizeEnvVar, "100")
+
+	dir := t.TempDir()
+	overLimitFile := filepath.Join(dir, "over.tf")
+	require.NoError(t, os.WriteFile(overLimitFile, make([]byte, 200), 0o600))
+
+	_, err := readTerraformFile(overLimitFile)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrTerraformFileTooLarge)
+
+	underLimitFile := filepath.Join(dir, "under.tf")
+	require.NoError(t, os.WriteFile(underLimitFile, make([]byte, 50), 0o600))
+
+	data, err := readTerraformFile(underLimitFile)
+	require.NoError(t, err)
+	assert.Len(t, data, 50)
+}
+
+func TestReadTerraformFile_MaxFileSizeEnvVar_HigherOverride(t *testing.T) {
+	raisedLimit := DefaultMaxFileSize + 1024
+	t.Setenv(MaxFileSizeEnvVar, fmt.Sprintf("%d", raisedLimit))
+
+	dir := t.TempDir()
+	overDefaultFile := filepath.Join(dir, "over_default.tf")
+	f, err := os.OpenFile(overDefaultFile, os.O_CREATE|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	require.NoError(t, f.Truncate(DefaultMaxFileSize+100))
+	require.NoError(t, f.Close())
+
+	data, err := readTerraformFile(overDefaultFile)
+	require.NoError(t, err)
+	assert.Len(t, data, int(DefaultMaxFileSize+100))
+}

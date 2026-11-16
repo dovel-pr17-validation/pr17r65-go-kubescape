@@ -1,0 +1,133 @@
+package scan
+
+import (
+	"testing"
+
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/mocks"
+	"github.com/spf13/cobra"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestGetControlCmd(t *testing.T) {
+	// Create a mock Kubescape interface
+	mockKubescape := &mocks.MockIKubescape{}
+	scanInfo := cautils.ScanInfo{
+		AccountID: "new",
+	}
+
+	cmd := getControlCmd(mockKubescape, &scanInfo)
+
+	assert.Equal(t, "control <control names list>/<control ids list>", cmd.Use)
+
+	err := cmd.Args(&cobra.Command{}, []string{})
+	expectedErrorMessage := "requires at least one control name"
+	assert.Equal(t, expectedErrorMessage, err.Error())
+
+	err = cmd.Args(&cobra.Command{}, []string{"C-0001,C-0002"})
+	assert.Nil(t, err)
+
+	err = cmd.Args(&cobra.Command{}, []string{"C-0001,C-0002,"})
+	expectedErrorMessage = "usage: <control-0>,<control-1>"
+	assert.Equal(t, expectedErrorMessage, err.Error())
+
+	err = cmd.Args(&cobra.Command{}, []string{""})
+	assert.Equal(t, "requires at least one control name", err.Error())
+
+	err = cmd.Args(&cobra.Command{}, []string{"   "})
+	assert.Equal(t, "requires at least one control name", err.Error())
+
+	err = cmd.Args(&cobra.Command{}, []string{"C-0001,   "})
+	assert.Equal(t, expectedErrorMessage, err.Error())
+
+	err = cmd.Args(&cobra.Command{}, []string{"   ,C-0002"})
+	assert.Equal(t, expectedErrorMessage, err.Error())
+
+	err = cmd.Args(&cobra.Command{}, []string{"C-0001,  ,C-0002"})
+	assert.Equal(t, expectedErrorMessage, err.Error())
+
+	err = cmd.RunE(&cobra.Command{}, []string{})
+	expectedErrorMessage = "bad argument: account ID must be a valid UUID"
+	assert.Equal(t, expectedErrorMessage, err.Error())
+}
+
+func TestGetControlCmdWithNonExistentControl(t *testing.T) {
+	// Create a mock Kubescape interface
+	mockKubescape := &mocks.MockIKubescape{}
+	scanInfo := cautils.ScanInfo{
+		AccountID: "new",
+	}
+
+	// Call the GetControlCmd function
+	cmd := getControlCmd(mockKubescape, &scanInfo)
+
+	// Run the command with a non-existent control argument
+	err := cmd.RunE(&cobra.Command{}, []string{"control", "C-0001,C-0002"})
+
+	// Check that there is an error and the error message is as expected
+	expectedErrorMessage := "bad argument: account ID must be a valid UUID"
+	assert.Error(t, err)
+	assert.Equal(t, expectedErrorMessage, err.Error())
+}
+
+func TestGetControlCmd_RunERejectsStdinMixedWithOtherInputs(t *testing.T) {
+	scanInfo := cautils.ScanInfo{}
+	cmd := getControlCmd(&mocks.MockIKubescape{}, &scanInfo)
+
+	err := cmd.RunE(cmd, []string{"C-0058", "-", "manifests/app.yaml"})
+
+	assert.EqualError(t, err, "usage: stdin input '-' cannot be combined with other input paths")
+}
+
+func TestGetControlCmd_RejectsFilePathWithPositionalInputPath(t *testing.T) {
+	mockKubescape := &mocks.MockIKubescape{}
+	scanInfo := cautils.ScanInfo{}
+
+	cmd := getControlCmd(mockKubescape, &scanInfo)
+	require.NoError(t, cmd.PersistentFlags().Set("file-path", "manifests/deployment.yaml"))
+
+	err := cmd.Args(cmd, []string{"C-0058", "./manifests"})
+
+	assert.EqualError(t, err, "usage: use either --file-path or positional input paths, not both")
+}
+
+func TestGetControlCmd_ArgsRejectsAmbiguousFilePathAndPositionalInputs(t *testing.T) {
+	scanInfo := cautils.ScanInfo{}
+	cmd := getControlCmd(&mocks.MockIKubescape{}, &scanInfo)
+	scanInfo.FilePath = "manifests/app.yaml"
+
+	err := cmd.Args(cmd, []string{"C-0058", "manifests"})
+
+	assert.EqualError(t, err, "usage: use either --file-path or positional input paths, not both")
+}
+
+func TestGetControlCmd_RunERejectsAmbiguousFilePathAndPositionalInputs(t *testing.T) {
+	scanInfo := cautils.ScanInfo{}
+	cmd := getControlCmd(&mocks.MockIKubescape{}, &scanInfo)
+	scanInfo.FilePath = "manifests/app.yaml"
+
+	err := cmd.RunE(cmd, []string{"C-0058", "manifests"})
+
+	assert.EqualError(t, err, "usage: use either --file-path or positional input paths, not both")
+}
+
+// TestControlCmdHasCoverageFlag ensures scan control registers --fail-coverage-below
+// so the flag is not silently ignored when passed to this subcommand.
+func TestControlCmdHasCoverageFlag(t *testing.T) {
+	scanInfo := cautils.ScanInfo{}
+	scanCmd := GetScanCommand(&mocks.MockIKubescape{})
+	controlCmd := getControlCmd(&mocks.MockIKubescape{}, &scanInfo)
+	scanCmd.AddCommand(controlCmd)
+
+	flag := controlCmd.InheritedFlags().Lookup("fail-coverage-below")
+	assert.NotNil(t, flag, "scan control should inherit --fail-coverage-below from scan persistent flags")
+}
+
+func TestGetControlCmd_NilKubescape(t *testing.T) {
+	scanInfo := cautils.ScanInfo{}
+	cmd := getControlCmd(nil, &scanInfo)
+	require.NotNil(t, cmd)
+	err := cmd.RunE(cmd, []string{"C-0001"})
+	require.EqualError(t, err, "uninitialized kubescape interface")
+}

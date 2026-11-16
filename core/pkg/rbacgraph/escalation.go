@@ -1,0 +1,804 @@
+package rbacgraph
+
+import (
+	"fmt"
+	"maps"
+	"slices"
+	"sort"
+	"strings"
+
+	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apiserver/pkg/authentication/serviceaccount"
+	"k8s.io/apiserver/pkg/authentication/user"
+)
+
+// superuserGroups are RBAC subject names the authorizer treats as
+// omnipotent without any RBAC object ever binding them -- reaching one via
+// impersonation is an immediate, unconditional cluster-admin win, and the
+// BFS would otherwise dead-end there (nothing binds these names, so
+// DirectRules finds nothing further).
+var superuserGroups = map[string]bool{
+	"system:masters": true,
+}
+
+// DirectEscalationEdges returns every one-hop escalation technique subject
+// can exercise given rules (their currently-known ScopedRules -- either
+// DirectRules(subject), or an enriched set after a bind-verb/escalate-verb
+// edge has already granted additional rules to subject). Self-edges (an
+// edge whose ToSubject is subject itself, e.g. a Pod-creation right letting
+// a ServiceAccount "assign" its own identity) are filtered out -- they
+// don't represent an escalation.
+func (idx *Index) DirectEscalationEdges(subject Subject, rules []ScopedRule) []EscalationEdge {
+	var rewrites []roleRewrite
+	for _, edge := range idx.escalateVerbEdges(rules) {
+		rewrites = append(rewrites, roleRewrite{subject: subject, edge: edge})
+	}
+	return idx.directEscalationEdges(subject, rules, rewrites)
+}
+
+func (idx *Index) directEscalationEdges(subject Subject, rules []ScopedRule, rewrites []roleRewrite) []EscalationEdge {
+	var edges []EscalationEdge
+	edges = append(edges, idx.impersonateEdges(rules)...)
+	edges = append(edges, idx.rewriteEdges(subject, rules, rewrites)...)
+	edges = append(edges, idx.bindVerbEdges(rules)...)
+	edges = append(edges, idx.assignServiceAccountEdges(rules)...)
+	edges = append(edges, idx.mintServiceAccountTokenEdges(rules)...)
+
+	out := edges[:0]
+	for _, e := range edges {
+		if e.ToSubject != nil && *e.ToSubject == subject {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// impersonateEdges implements the impersonate primitive: the "impersonate"
+// verb (core API group) on serviceaccounts/users/groups lets a subject act
+// as the impersonated identity outright.
+//
+// serviceaccounts targets include collected objects and binding-evidenced
+// identities regardless of whether the rule is resourceNames-restricted (an
+// unrestricted grant is a superset of the restricted case, so it must
+// enumerate the same targets too, in addition to being reported as
+// Unbounded for whatever this Index didn't collect).
+//
+// User targets come from resourceNames or, for an unrestricted grant, User
+// subjects in collected bindings. The latter is not a complete inventory, so
+// the unbounded warning remains. Groups are enumerated only when explicitly
+// named by resourceNames; unrestricted groups include system:masters.
+// These two branches also
+// only fire from a cluster-wide rule (granted via ClusterRoleBinding):
+// Users and Groups are not namespaced identities, and Kubernetes' RBAC
+// authorizer does not honor a namespace-scoped Role/RoleBinding's grant
+// against them -- only serviceaccounts is itself a namespaced resource
+// type a Role can meaningfully constrain.
+func (idx *Index) impersonateEdges(rules []ScopedRule) []EscalationEdge {
+	var edges []EscalationEdge
+	usernameAuthorized := canImpersonateUsername(rules)
+	for _, sr := range rules {
+		rule := sr.Rule
+		if !containsOrWildcard(rule.Verbs, "impersonate") || !containsOrWildcard(rule.APIGroups, "") {
+			continue
+		}
+		names, restricted := namedResources(rule)
+
+		if containsOrWildcard(rule.Resources, "serviceaccounts") || containsOrWildcard(rule.Resources, "*") {
+			if !restricted {
+				edges = append(edges, EscalationEdge{
+					Primitive:        PrimitiveImpersonate,
+					ImpersonatedKind: KindServiceAccount,
+					Detail:           "can impersonate any ServiceAccount (unrestricted impersonate on serviceaccounts)",
+					Unbounded:        true,
+					Scope:            sr.Namespace,
+				})
+			}
+			for _, target := range idx.serviceAccountImpersonationTargets(sr.Namespace, names) {
+				if restricted && !resourceNameMatches(names, target.Name) {
+					continue
+				}
+				edges = append(edges, EscalationEdge{
+					Primitive: PrimitiveImpersonate,
+					Detail:    fmt.Sprintf("can impersonate ServiceAccount %s/%s", target.Namespace, target.Name),
+					ToSubject: &target,
+				})
+			}
+		}
+		if sr.Namespace != "" {
+			continue // users/groups impersonation is not honored from a namespace-scoped grant
+		}
+		if containsOrWildcard(rule.Resources, "users") || containsOrWildcard(rule.Resources, "*") {
+			targets := names
+			if !restricted {
+				edges = append(edges, EscalationEdge{Primitive: PrimitiveImpersonate, ImpersonatedKind: KindUser, Detail: "can impersonate any User (unrestricted impersonate on users)", Unbounded: true})
+				targets = idx.boundUserNames()
+			}
+			for _, name := range targets {
+				// ServiceAccount usernames require impersonate on serviceaccounts.
+				if name == "" {
+					continue
+				}
+				if _, _, err := serviceaccount.SplitUsername(name); err == nil {
+					continue
+				}
+				edges = append(edges, EscalationEdge{Primitive: PrimitiveImpersonate, Detail: fmt.Sprintf("can impersonate User %q", name), ToSubject: &Subject{Kind: KindUser, Name: name}})
+			}
+		}
+		if containsOrWildcard(rule.Resources, "groups") || containsOrWildcard(rule.Resources, "*") {
+			// Impersonate-Group must accompany an authorized Impersonate-User.
+			// Being the caller already does not authorize impersonating oneself.
+			if !usernameAuthorized {
+				continue
+			}
+			if !restricted {
+				edges = append(edges, EscalationEdge{Primitive: PrimitiveImpersonate, ImpersonatedKind: KindGroup, Detail: "can impersonate any Group (unrestricted impersonate on groups)", Unbounded: true})
+			} else {
+				for _, name := range names {
+					edges = append(edges, EscalationEdge{Primitive: PrimitiveImpersonate, Detail: fmt.Sprintf("can impersonate Group %q", name), ToSubject: &Subject{Kind: KindGroup, Name: name}})
+				}
+			}
+		}
+	}
+	return edges
+}
+
+// boundUserNames enumerates only user identities whose permissions can be
+// recovered from this snapshot. An unrestricted grant still carries a warning
+// for all other users; it does not prove they hold arbitrary permissions.
+func (idx *Index) boundUserNames() []string {
+	seen := map[string]bool{}
+	add := func(subjects []rbacv1.Subject) {
+		for _, subject := range subjects {
+			if subject.Kind == "User" && subject.Name != "" {
+				seen[subject.Name] = true
+			} else if subject.Kind == "Group" && subject.Name == user.AllUnauthenticated {
+				// Kubernetes assigns this group when impersonating system:anonymous,
+				// even when no binding explicitly names that user.
+				seen[user.Anonymous] = true
+			} else if subject.Kind == "Group" && subject.Name == user.AllAuthenticated {
+				// An unrestricted User grant can choose an ordinary username even
+				// when only the authenticated group, not a concrete user, is bound.
+				seen["impersonation-target"] = true
+			}
+		}
+	}
+	for _, binding := range idx.roleBindings {
+		add(binding.Subjects)
+	}
+	for _, binding := range idx.clusterRoleBindings {
+		add(binding.Subjects)
+	}
+	return slices.Sorted(maps.Keys(seen))
+}
+
+// roleCoverage tracks, for one verb across one scope, whether a subject's
+// rules cover every object of a resource type (Unrestricted) or only
+// specific named ones (Names) -- used by escalateVerbEdges to correlate
+// two different verbs (escalate, and update/patch) against the same
+// target role, not just the same scope.
+type roleCoverage struct {
+	unrestricted bool
+	names        map[string]bool
+}
+
+func (c *roleCoverage) add(rule rbacv1.PolicyRule) {
+	names, restricted := namedResources(rule)
+	if !restricted {
+		c.unrestricted = true
+		return
+	}
+	for _, n := range names {
+		// escalate, update and patch always name the Role they act on, so an
+		// empty entry matches none of those requests. No object can have an
+		// empty name either, so it is never a Role the snapshot missed.
+		if n == "" {
+			continue
+		}
+		c.names[n] = true
+	}
+}
+
+// mergeCoverage returns the union of two coverages, either of which may be
+// nil; it is nil only when both are.
+func mergeCoverage(a, b *roleCoverage) *roleCoverage {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	merged := &roleCoverage{unrestricted: a.unrestricted || b.unrestricted, names: map[string]bool{}}
+	maps.Copy(merged.names, a.names)
+	maps.Copy(merged.names, b.names)
+	return merged
+}
+
+// coverageScopes returns, sorted, every scope either map has an entry for.
+func coverageScopes(a, b map[string]*roleCoverage) []string {
+	scopes := map[string]bool{}
+	for scope := range a {
+		scopes[scope] = true
+	}
+	for scope := range b {
+		scopes[scope] = true
+	}
+	return slices.Sorted(maps.Keys(scopes))
+}
+
+// escalateVerbEdges implements the escalate-verb primitive: Kubernetes'
+// RBAC self-escalation prevention normally stops a subject from granting a
+// Role/ClusterRole rules it doesn't already itself hold, unless the
+// subject also holds the "escalate" verb on that resource type -- combined
+// with update/patch (needed to actually modify the object), that's a
+// documented built-in bypass for rewriting the role. These are rewrite
+// capabilities; rewriteEdges separately establishes how their rules can be
+// acquired through bindings. The escalate grant and the update/patch grant
+// must actually cover the *same* role -- two independent resourceNames-
+// restricted grants for different roles (escalate on role-a, update on
+// role-b) don't combine into anything exploitable, so this correlates them
+// by target name (or scope-wide, when either or both sides are
+// unrestricted) rather than just checking "does the subject hold both verbs
+// somewhere in this scope." The two grants need not have the same scope: for
+// a Role, either half may be granted in the Role's namespace or cluster-wide
+// (see the loop below). Only clusterroles at cluster scope and roles at
+// either scope are modeled; a namespace-scoped rule naming the
+// cluster-scoped "clusterroles" resource type is an unusual enough pattern
+// that this package doesn't attempt to reason about its effect.
+func (idx *Index) escalateVerbEdges(rules []ScopedRule) []EscalationEdge {
+	roleKinds := map[string]string{"clusterroles": "ClusterRole", "roles": "Role"}
+	var edges []EscalationEdge
+	for _, resource := range []string{"clusterroles", "roles"} {
+		escalateByScope := map[string]*roleCoverage{}
+		mutateByScope := map[string]*roleCoverage{}
+		for _, sr := range rules {
+			if ruleGrants(sr.Rule, "rbac.authorization.k8s.io", resource, "escalate") {
+				c, ok := escalateByScope[sr.Namespace]
+				if !ok {
+					c = &roleCoverage{names: map[string]bool{}}
+					escalateByScope[sr.Namespace] = c
+				}
+				c.add(sr.Rule)
+			}
+			if ruleGrants(sr.Rule, "rbac.authorization.k8s.io", resource, "update") || ruleGrants(sr.Rule, "rbac.authorization.k8s.io", resource, "patch") {
+				c, ok := mutateByScope[sr.Namespace]
+				if !ok {
+					c = &roleCoverage{names: map[string]bool{}}
+					mutateByScope[sr.Namespace] = c
+				}
+				c.add(sr.Rule)
+			}
+		}
+
+		for _, scope := range coverageScopes(escalateByScope, mutateByScope) {
+			if resource == "clusterroles" && scope != "" {
+				continue
+			}
+			esc, mut := escalateByScope[scope], mutateByScope[scope]
+			if scope != "" {
+				// The API server authorizes escalate and update/patch as two
+				// separate requests in the Role's namespace, and a
+				// cluster-wide grant answers either one there. So within a
+				// namespace each half may come from that namespace's own
+				// grants or from the cluster-wide ones.
+				esc = mergeCoverage(esc, escalateByScope[""])
+				mut = mergeCoverage(mut, mutateByScope[""])
+			}
+			if esc == nil || mut == nil {
+				continue
+			}
+
+			if esc.unrestricted && mut.unrestricted {
+				edges = append(edges, EscalationEdge{
+					Primitive: PrimitiveEscalateVerb,
+					Detail:    fmt.Sprintf("holds escalate + update/patch on %s.rbac.authorization.k8s.io", resource),
+					Unbounded: true,
+					Scope:     scope,
+					Target:    &RoleTarget{Kind: roleKinds[resource], Namespace: scope},
+				})
+				continue
+			}
+
+			// targetNames == empty here (both grants restricted, no
+			// overlapping name) is a genuine rejection -- escalate on
+			// role-a and update on role-b don't authorize rewriting
+			// either, so no edge, no fallback.
+			var targetNames []string
+			switch {
+			case esc.unrestricted:
+				targetNames = setToSlice(mut.names)
+			case mut.unrestricted:
+				targetNames = setToSlice(esc.names)
+			default:
+				targetNames = intersectSets(esc.names, mut.names)
+			}
+			if len(targetNames) == 0 {
+				continue
+			}
+			sort.Strings(targetNames)
+
+			if resource == "clusterroles" {
+				matched := idx.matchingClusterRoles(targetNames, true)
+				if len(matched) == 0 {
+					// targetNames is non-empty (the grants do overlap on a
+					// name) but resolves to no object this Index actually
+					// collected -- that could mean the name is stale, or it
+					// could mean a partial/paginated collection missed it.
+					// Fail toward reporting risk, not silence: the prior
+					// (pre-name-correlation) version of this code reported a
+					// scope-level Unbounded here, and dropping that
+					// silently would be a regression in exactly the
+					// direction this package exists to avoid.
+					//
+					// One edge per name, each still naming its object: the
+					// finding is about scope-level risk, but the grant itself
+					// reaches no further than these names, and a Target left
+					// unnamed would say it covers every ClusterRole.
+					for _, name := range targetNames {
+						edges = append(edges, EscalationEdge{
+							Primitive: PrimitiveEscalateVerb,
+							Detail:    fmt.Sprintf("holds escalate + update/patch on ClusterRole %q, not found in the collected snapshot -- may be a partial collection, not a confirmed absence", name),
+							Unbounded: true,
+							Scope:     "",
+							Target:    &RoleTarget{Kind: "ClusterRole", Name: name},
+						})
+					}
+				}
+				for _, cr := range matched {
+					edges = append(edges, EscalationEdge{
+						Primitive: PrimitiveEscalateVerb,
+						Detail:    fmt.Sprintf("holds escalate + update/patch on ClusterRole %q: can rewrite its rules", cr.Name),
+						Unbounded: true,
+						Scope:     "",
+						Target:    &RoleTarget{Kind: "ClusterRole", Name: cr.Name},
+					})
+				}
+				continue
+			}
+
+			var roles []*rbacv1.Role
+			if scope == "" {
+				roles = idx.matchingRolesAnyNamespace(targetNames, true)
+			} else {
+				roles = idx.matchingRoles(scope, targetNames, true)
+			}
+			if len(roles) == 0 {
+				// Preserve the partial-collection warning, one edge per name
+				// for the same reason as the clusterroles case above. A
+				// cluster-wide grant on Roles still targets namespaced
+				// objects: without a matching Role, its namespace is unknown,
+				// not cluster-wide.
+				for _, name := range targetNames {
+					edges = append(edges, EscalationEdge{
+						Primitive:    PrimitiveEscalateVerb,
+						Detail:       fmt.Sprintf("holds escalate + update/patch on Role %q in namespace scope %q, not found in the collected snapshot -- may be a partial collection, not a confirmed absence", name, scope),
+						Unbounded:    true,
+						Scope:        scope,
+						ScopeUnknown: scope == "",
+						Target:       &RoleTarget{Kind: "Role", Namespace: scope, Name: name},
+					})
+				}
+			}
+			for _, r := range roles {
+				edges = append(edges, EscalationEdge{
+					Primitive: PrimitiveEscalateVerb,
+					Detail:    fmt.Sprintf("holds escalate + update/patch on Role %q in namespace %q: can rewrite its rules", r.Name, r.Namespace),
+					Unbounded: true,
+					Scope:     r.Namespace,
+					Target:    &RoleTarget{Kind: "Role", Namespace: r.Namespace, Name: r.Name},
+				})
+			}
+		}
+	}
+	return edges
+}
+
+// bindVerbEdges implements the bind-verb primitive: the "bind" verb on a
+// Role/ClusterRole is RBAC's other documented self-escalation-prevention
+// bypass -- combined with the ability to create a RoleBinding or
+// ClusterRoleBinding, or to update an existing binding of that role, a subject
+// can attach any Role/ClusterRole they can
+// bind to a subject of their choosing (in practice, themselves), adopting
+// its rules without ever having held them directly. A cluster-wide grant of
+// either half (bind, or create rolebindings/clusterrolebindings) is treated
+// as covering every namespace this Index knows about, not skipped -- it is
+// the more powerful case, not an edge case to exclude. A namespace-scoped
+// bind grant, on the other hand, reaches no further than RoleBindings in
+// that namespace.
+func (idx *Index) bindVerbEdges(rules []ScopedRule) []EscalationEdge {
+	var edges []EscalationEdge
+
+	for _, sr := range rules {
+		if !ruleGrants(sr.Rule, "rbac.authorization.k8s.io", "clusterroles", "bind") {
+			continue
+		}
+		names, restricted := namedResources(sr.Rule)
+		targets := idx.matchingClusterRoles(names, restricted)
+
+		// The API server checks bind in the namespace of the binding being
+		// created: none for a ClusterRoleBinding, the RoleBinding's own
+		// otherwise (BindingAuthorized in Kubernetes' pkg/registry/rbac).
+		// A bind grant confined to one namespace therefore authorizes
+		// neither a ClusterRoleBinding nor a RoleBinding anywhere else.
+		if sr.Namespace == "" {
+			for _, cr := range targets {
+				via := idx.clusterRoleBindingPath(rules, cr.Name)
+				if via == "" {
+					continue
+				}
+				edges = append(edges, EscalationEdge{
+					Primitive:    PrimitiveBindVerb,
+					Detail:       fmt.Sprintf("can bind ClusterRole %q cluster-wide via %s", cr.Name, via),
+					GrantedRules: scopeRules(cr.Rules, ""),
+					Target:       &RoleTarget{Kind: "ClusterRole", Name: cr.Name},
+				})
+			}
+		}
+		for _, ns := range idx.knownNamespaces() {
+			if sr.Namespace != "" && sr.Namespace != ns {
+				continue
+			}
+			for _, cr := range targets {
+				via := idx.roleBindingPath(rules, ns, RoleTarget{Kind: "ClusterRole", Name: cr.Name})
+				if via == "" {
+					continue
+				}
+				edges = append(edges, EscalationEdge{
+					Primitive:    PrimitiveBindVerb,
+					Detail:       fmt.Sprintf("can bind ClusterRole %q within namespace %q via %s", cr.Name, ns, via),
+					GrantedRules: scopeRules(cr.Rules, ns),
+					Scope:        ns,
+					Target:       &RoleTarget{Kind: "ClusterRole", Name: cr.Name},
+				})
+			}
+		}
+	}
+
+	for _, sr := range rules {
+		if !ruleGrants(sr.Rule, "rbac.authorization.k8s.io", "roles", "bind") {
+			continue
+		}
+		names, restricted := namedResources(sr.Rule)
+		var candidates []*rbacv1.Role
+		if sr.Namespace == "" {
+			candidates = idx.matchingRolesAnyNamespace(names, restricted)
+		} else {
+			candidates = idx.matchingRoles(sr.Namespace, names, restricted)
+		}
+		for _, r := range candidates {
+			via := idx.roleBindingPath(rules, r.Namespace, RoleTarget{Kind: "Role", Namespace: r.Namespace, Name: r.Name})
+			if via == "" {
+				continue
+			}
+			edges = append(edges, EscalationEdge{
+				Primitive:    PrimitiveBindVerb,
+				Detail:       fmt.Sprintf("can bind Role %q within namespace %q via %s", r.Name, r.Namespace, via),
+				GrantedRules: scopeRules(r.Rules, r.Namespace),
+				Scope:        r.Namespace,
+				Target:       &RoleTarget{Kind: "Role", Namespace: r.Namespace, Name: r.Name},
+			})
+		}
+	}
+	return edges
+}
+
+// serviceAccountWorkload is a built-in resource whose spec carries a pod
+// template (or is a Pod), so whoever writes it chooses the
+// spec.serviceAccountName the resulting pods run under.
+type serviceAccountWorkload struct {
+	apiGroup string
+	resource string
+	// templateMutable reports whether the pod template of an existing object
+	// can be changed, so update/patch on it can repoint it at another
+	// ServiceAccount. A Pod's serviceAccountName and a Job's template are
+	// immutable once the object exists, so for those only create counts.
+	templateMutable bool
+}
+
+// serviceAccountWorkloads lists every built-in workload the
+// assign-serviceaccount primitive recognizes. Custom resources that
+// reconcile into pods are deliberately absent: nothing in RBAC objects says
+// which of them do.
+var serviceAccountWorkloads = []serviceAccountWorkload{
+	{apiGroup: "", resource: "pods"},
+	{apiGroup: "", resource: "replicationcontrollers", templateMutable: true},
+	{apiGroup: "apps", resource: "deployments", templateMutable: true},
+	{apiGroup: "apps", resource: "statefulsets", templateMutable: true},
+	{apiGroup: "apps", resource: "daemonsets", templateMutable: true},
+	{apiGroup: "apps", resource: "replicasets", templateMutable: true},
+	{apiGroup: "batch", resource: "jobs"},
+	{apiGroup: "batch", resource: "cronjobs", templateMutable: true},
+}
+
+// label names the workload the way kubectl does: group-qualified unless it
+// is in the core group.
+func (w serviceAccountWorkload) label() string {
+	if w.apiGroup == "" {
+		return w.resource
+	}
+	return w.apiGroup + "/" + w.resource
+}
+
+// workloadCapability is one way a rule lets its holder select the
+// ServiceAccount a workload runs as, described as "<verb> <resource>".
+type workloadCapability struct {
+	description string
+	// namedOnly is true when the rule grants it only for objects listed in
+	// resourceNames, so it reaches those objects and not every one.
+	namedOnly bool
+}
+
+// serviceAccountCapabilities returns what rule lets its holder do to
+// workloads that selects the ServiceAccount they run as. It is empty when
+// the rule grants none of them.
+//
+// create is a top-level create, so resourceNames cannot authorize it (see
+// ruleGrantsUnnamedCreate). update and patch act on an existing, named
+// object, so a rule restricted to real names still lets its holder repoint
+// those objects -- and only those, which namedOnly records.
+func serviceAccountCapabilities(rule rbacv1.PolicyRule) []workloadCapability {
+	var caps []workloadCapability
+	for _, w := range serviceAccountWorkloads {
+		if ruleGrantsUnnamedCreate(rule, w.apiGroup, w.resource) {
+			caps = append(caps, workloadCapability{description: "create " + w.label()})
+		}
+		if !w.templateMutable {
+			continue
+		}
+		for _, verb := range []string{"update", "patch"} {
+			if ruleGrantsExistingObject(rule, w.apiGroup, w.resource, verb) {
+				caps = append(caps, workloadCapability{
+					description: verb + " " + w.label(),
+					namedOnly:   len(rule.ResourceNames) > 0,
+				})
+			}
+		}
+	}
+	return caps
+}
+
+// assignServiceAccountEdges implements the assign-serviceaccount primitive:
+// a subject who can write a workload -- a Pod, or a controller such as a
+// Deployment or CronJob whose pod template the controller turns into pods --
+// chooses spec.serviceAccountName freely (see the package doc comment's
+// trust-model note on admission-time restrictions this package does not
+// model), so the subject can run a container as any ServiceAccount in that
+// namespace and read its mounted token from within. The subject never needs
+// permission to create the resulting Pods itself: the controller does that.
+//
+// One edge is emitted per target ServiceAccount, however many rules and
+// workload resources grant the capability; its Detail lists them all. A
+// capability is qualified "(named objects only)" only when every rule that
+// grants it is restricted by resourceNames.
+func (idx *Index) assignServiceAccountEdges(rules []ScopedRule) []EscalationEdge {
+	// namespace -> capability -> whether every granting rule names objects.
+	namedOnlyByNS := map[string]map[string]bool{}
+	for _, sr := range rules {
+		caps := serviceAccountCapabilities(sr.Rule)
+		if len(caps) == 0 {
+			continue
+		}
+		for _, ns := range idx.targetNamespaces(sr.Namespace) {
+			if namedOnlyByNS[ns] == nil {
+				namedOnlyByNS[ns] = map[string]bool{}
+			}
+			for _, c := range caps {
+				prev, seen := namedOnlyByNS[ns][c.description]
+				namedOnlyByNS[ns][c.description] = c.namedOnly && (!seen || prev)
+			}
+		}
+	}
+
+	var edges []EscalationEdge
+	for _, ns := range slices.Sorted(maps.Keys(namedOnlyByNS)) {
+		var via []string
+		for _, desc := range slices.Sorted(maps.Keys(namedOnlyByNS[ns])) {
+			if namedOnlyByNS[ns][desc] {
+				desc += " (named objects only)"
+			}
+			via = append(via, desc)
+		}
+		for _, saName := range idx.serviceAccountsByNS[ns] {
+			edges = append(edges, EscalationEdge{
+				Primitive: PrimitiveAssignServiceAccount,
+				Detail:    fmt.Sprintf("can assign spec.serviceAccountName=%q to workloads in namespace %q (%s), inheriting its mounted token", saName, ns, strings.Join(via, ", ")),
+				ToSubject: &Subject{Kind: KindServiceAccount, Namespace: ns, Name: saName},
+			})
+		}
+	}
+	return edges
+}
+
+// mintServiceAccountTokenEdges implements the mint-serviceaccount-token
+// primitive: create on the serviceaccounts/token subresource (the
+// TokenRequest API) mints a live token for the named ServiceAccount
+// directly, no pod required. Unlike a top-level create, this is a create on
+// an already-named parent object (POST .../serviceaccounts/{name}/token),
+// so resourceNames legitimately restricts it -- this is intentionally not
+// routed through ruleGrantsUnnamedCreate.
+func (idx *Index) mintServiceAccountTokenEdges(rules []ScopedRule) []EscalationEdge {
+	var edges []EscalationEdge
+	for _, sr := range rules {
+		if !ruleGrantsSubresource(sr.Rule, "", "serviceaccounts", "token", "create") {
+			continue
+		}
+		names, restricted := namedResources(sr.Rule)
+		for _, ns := range idx.targetNamespaces(sr.Namespace) {
+			for _, saName := range idx.serviceAccountsByNS[ns] {
+				if restricted && !resourceNameMatches(names, saName) {
+					continue
+				}
+				edges = append(edges, EscalationEdge{
+					Primitive: PrimitiveMintServiceAccountToken,
+					Detail:    fmt.Sprintf("can mint a live token for ServiceAccount %s/%s via the TokenRequest API", ns, saName),
+					ToSubject: &Subject{Kind: KindServiceAccount, Namespace: ns, Name: saName},
+				})
+			}
+		}
+	}
+	return edges
+}
+
+// targetNamespaces expands a ScopedRule's own scope into the namespaces an
+// edge should enumerate targets against: just that one namespace for a
+// namespace-scoped rule, or every namespace this Index has ServiceAccount
+// data for when the rule is cluster-wide. Sorted, like every other
+// map-derived list in this package -- see matchingClusterRoles.
+func (idx *Index) targetNamespaces(scopeNamespace string) []string {
+	if scopeNamespace != "" {
+		return []string{scopeNamespace}
+	}
+	return slices.Sorted(maps.Keys(idx.serviceAccountsByNS))
+}
+
+// knownNamespaces returns every namespace this Index has any evidence of,
+// drawn from collected ServiceAccounts, Roles, and RoleBindings -- used to
+// expand a cluster-wide grant (e.g. create rolebindings with no namespace
+// restriction) into the concrete namespaces this package can reason about.
+// Sorted, like every other map-derived list in this package -- see
+// matchingClusterRoles.
+func (idx *Index) knownNamespaces() []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(ns string) {
+		if ns == "" || seen[ns] {
+			return
+		}
+		seen[ns] = true
+		out = append(out, ns)
+	}
+	for ns := range idx.serviceAccountsByNS {
+		add(ns)
+	}
+	for _, r := range idx.roles {
+		add(r.Namespace)
+	}
+	for _, rb := range idx.roleBindings {
+		add(rb.Namespace)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// matchingClusterRoles returns the collected ClusterRoles a grant covers, in
+// name order. idx.clusterRoles is a map, and every list this package derives
+// from a map feeds an EscalationEdge and so reaches the reported result, both
+// as the order edges are emitted in and as the order the BFS discovers
+// subjects in. Reading map order directly would make the same cluster
+// snapshot report differently-ordered escalation paths on every run.
+func (idx *Index) matchingClusterRoles(names []string, restricted bool) []*rbacv1.ClusterRole {
+	var out []*rbacv1.ClusterRole
+	for _, name := range slices.Sorted(maps.Keys(idx.clusterRoles)) {
+		cr := idx.clusterRoles[name]
+		if restricted && !resourceNameMatches(names, cr.Name) {
+			continue
+		}
+		out = append(out, cr)
+	}
+	return out
+}
+
+func (idx *Index) matchingRoles(namespace string, names []string, restricted bool) []*rbacv1.Role {
+	var out []*rbacv1.Role
+	for _, key := range slices.Sorted(maps.Keys(idx.roles)) {
+		r := idx.roles[key]
+		if r.Namespace != namespace {
+			continue
+		}
+		if restricted && !resourceNameMatches(names, r.Name) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// matchingRolesAnyNamespace is matchingRoles without a namespace filter --
+// for a cluster-wide grant (e.g. bind on roles via a ClusterRoleBinding),
+// which applies to Role objects in every namespace, not just one.
+func (idx *Index) matchingRolesAnyNamespace(names []string, restricted bool) []*rbacv1.Role {
+	var out []*rbacv1.Role
+	for _, key := range slices.Sorted(maps.Keys(idx.roles)) {
+		r := idx.roles[key]
+		if restricted && !resourceNameMatches(names, r.Name) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func (idx *Index) hasClusterWideCreate(rules []ScopedRule, resource string) bool {
+	for _, sr := range rules {
+		if sr.Namespace == "" && ruleGrantsUnnamedCreate(sr.Rule, "rbac.authorization.k8s.io", resource) {
+			return true
+		}
+	}
+	return false
+}
+
+func (idx *Index) hasCreateInNamespace(rules []ScopedRule, resource, namespace string) bool {
+	for _, sr := range rules {
+		if sr.Namespace == namespace && ruleGrantsUnnamedCreate(sr.Rule, "rbac.authorization.k8s.io", resource) {
+			return true
+		}
+	}
+	return false
+}
+
+// canCreateRoleBindingsIn reports whether rules lets the subject create a
+// RoleBinding in namespace ns -- either via a grant scoped to exactly that
+// namespace, or a cluster-wide grant (covers every namespace).
+func (idx *Index) canCreateRoleBindingsIn(rules []ScopedRule, ns string) bool {
+	return idx.hasCreateInNamespace(rules, "rolebindings", ns) || idx.hasClusterWideCreate(rules, "rolebindings")
+}
+
+// clusterRoleBindingPath describes how rules let the subject attach a
+// ClusterRole it may bind to itself cluster-wide, or returns "" if they do not.
+// The API server makes the same bind check on an update as on a create (see
+// Kubernetes' pkg/registry/rbac/clusterrolebinding/policybased), and although a
+// binding's roleRef is immutable its subjects are not, so update or patch of an
+// existing binding of this role serves as well as creating one.
+func (idx *Index) clusterRoleBindingPath(rules []ScopedRule, clusterRole string) string {
+	if idx.hasClusterWideCreate(rules, "clusterrolebindings") {
+		return "a new ClusterRoleBinding"
+	}
+	var editable []string
+	for _, binding := range idx.clusterRoleBindingsByRole[clusterRole] {
+		if canEditBinding(rules, "clusterrolebindings", "", binding.Name) {
+			editable = append(editable, binding.Name)
+		}
+	}
+	return bindingEditPath("ClusterRoleBinding", editable)
+}
+
+// roleBindingPath is clusterRoleBindingPath for a RoleBinding in namespace.
+func (idx *Index) roleBindingPath(rules []ScopedRule, namespace string, target RoleTarget) string {
+	if idx.canCreateRoleBindingsIn(rules, namespace) {
+		return "a new RoleBinding"
+	}
+	var editable []string
+	for _, binding := range idx.roleBindingsByRole[target] {
+		if binding.Namespace == namespace && canEditBinding(rules, "rolebindings", namespace, binding.Name) {
+			editable = append(editable, binding.Name)
+		}
+	}
+	return bindingEditPath("RoleBinding", editable)
+}
+
+// bindingEditPath names the first editable binding, so the explanation does
+// not depend on the order the bindings were collected in.
+func bindingEditPath(kind string, editable []string) string {
+	if len(editable) == 0 {
+		return ""
+	}
+	return "an update to " + kind + " " + slices.Min(editable)
+}
+
+func scopeRules(rules []rbacv1.PolicyRule, namespace string) []ScopedRule {
+	out := make([]ScopedRule, 0, len(rules))
+	for _, r := range rules {
+		out = append(out, ScopedRule{Rule: r, Namespace: namespace})
+	}
+	return out
+}

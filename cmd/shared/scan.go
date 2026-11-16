@@ -1,0 +1,346 @@
+package shared
+
+import (
+	"fmt"
+	"math"
+	"slices"
+	"strings"
+
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/pkg/resultshandling/printer"
+	reporthandlingapis "github.com/kubescape/opa-utils/reporthandling/apis"
+	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/labels"
+)
+
+// ScanFormats and ImageScanFormats are derived from printer.AllFormats and
+// printer.ImageFormats to keep a single source of truth — see printresults.go
+// for why the two lists differ (not every printer supports image scans, e.g. github-actions).
+var (
+	ScanFormats      = printer.AllFormats
+	ImageScanFormats = printer.ImageFormats
+)
+
+// SupportedViews lists the views supported by the --view flag.
+var SupportedViews = []string{
+	string(cautils.ResourceViewType),
+	string(cautils.ControlViewType),
+	string(cautils.SecurityViewType),
+	string(cautils.NamespaceViewType),
+}
+
+var ErrUnknownSeverity = fmt.Errorf("unknown severity. Supported severities are: %s", strings.Join(reporthandlingapis.GetSupportedSeverities(), ", "))
+
+// ErrBadThreshold is returned when a numeric threshold is outside the valid range [0, 100].
+var ErrBadThreshold = fmt.Errorf("bad argument: out of range threshold")
+
+var (
+	ErrKeepLocalOrSubmit        = fmt.Errorf("you can use `keep-local` or `submit`, but not both")
+	ErrOmitRawResourcesOrSubmit = fmt.Errorf("you can use `omit-raw-resources` or `submit`, but not both")
+)
+
+// ValidateThresholds validates that FailThreshold, ComplianceThreshold and
+// FailCoverageThreshold are all within [0, 100]. This mirrors the check in
+// validateFrameworkScanInfo and validateControlScanInfo.
+func ValidateThresholds(scanInfo *cautils.ScanInfo) error {
+	if err := ValidateThreshold("fail-threshold", scanInfo.FailThreshold); err != nil {
+		return err
+	}
+	if err := ValidateThreshold("compliance-threshold", scanInfo.ComplianceThreshold); err != nil {
+		return err
+	}
+	return ValidateThreshold("fail-coverage-below", scanInfo.FailCoverageThreshold)
+}
+
+// ValidateThreshold returns an error wrapping ErrBadThreshold, and naming the
+// flag and its value, when value is NaN or outside [0, 100].
+func ValidateThreshold(flag string, value float32) error {
+	if math.IsNaN(float64(value)) || value < 0 || value > 100 {
+		return fmt.Errorf("%w: --%s must be between 0 and 100, got %v", ErrBadThreshold, flag, value)
+	}
+	return nil
+}
+
+// ValidateSeverity returns an error if a given severity is not known, nil otherwise
+func ValidateSeverity(severity string) error {
+	trimmed := strings.TrimSpace(severity)
+	for _, val := range reporthandlingapis.GetSupportedSeverities() {
+		if strings.EqualFold(trimmed, val) {
+			return nil
+		}
+	}
+	return ErrUnknownSeverity
+}
+
+// ValidateSeverityRange returns an error when min is greater than max, which
+// would produce empty output rather than an obvious error. Both values must
+// already have been validated by ValidateSeverity before this is called.
+func ValidateSeverityRange(min, max string) error {
+	if severityOrdinal(min) > severityOrdinal(max) {
+		return fmt.Errorf("min severity cannot be greater than max severity (%s > %s)", min, max)
+	}
+	return nil
+}
+
+// severityOrdinal maps a severity string to the same integer ordinal used by
+// reporthandlingapis.ControlSeverityToInt so that CLI-layer comparisons stay
+// in sync with the core library. Unknown values map to SeverityUnknown (0).
+func severityOrdinal(severity string) int {
+	switch strings.ToLower(strings.TrimSpace(severity)) {
+	case strings.ToLower(reporthandlingapis.SeverityCriticalString):
+		return reporthandlingapis.SeverityCritical
+	case strings.ToLower(reporthandlingapis.SeverityHighString):
+		return reporthandlingapis.SeverityHigh
+	case strings.ToLower(reporthandlingapis.SeverityMediumString):
+		return reporthandlingapis.SeverityMedium
+	case strings.ToLower(reporthandlingapis.SeverityLowString):
+		return reporthandlingapis.SeverityLow
+	default:
+		return reporthandlingapis.SeverityUnknown
+	}
+}
+
+// ValidateScanFormat returns an error if any comma-separated entry in format is not a supported format.
+func ValidateScanFormat(format string, supported []string) error {
+	var entries int
+	for f := range strings.SplitSeq(format, ",") {
+		raw := strings.TrimSpace(f)
+		if raw == "" {
+			continue
+		}
+		entries++
+		if !slices.Contains(supported, strings.ToLower(raw)) {
+			return fmt.Errorf("invalid format %q, supported formats: %s", raw, strings.Join(supported, ", "))
+		}
+	}
+	// Reject separator/whitespace-only input (e.g. "," or " ") that resolves to no format.
+	// A truly empty value is left to the caller's "format cannot be empty" check.
+	if entries == 0 && strings.TrimSpace(format) != "" {
+		return fmt.Errorf("invalid format %q, supported formats: %s", format, strings.Join(supported, ", "))
+	}
+	return nil
+}
+
+// NormalizeScanFormats converts a comma-separated format string into a trimmed, lowercased, comma-separated string without empty entries.
+func NormalizeScanFormats(format string) string {
+	var entries []string
+	for f := range strings.SplitSeq(format, ",") {
+		if trimmed := strings.ToLower(strings.TrimSpace(f)); trimmed != "" {
+			entries = append(entries, trimmed)
+		}
+	}
+	return strings.Join(entries, ",")
+}
+
+// ValidateView returns an error if view is not one of the supported views.
+func ValidateView(view string) error {
+	trimmed := strings.ToLower(strings.TrimSpace(view))
+	if trimmed == "" {
+		return fmt.Errorf("view cannot be empty, supported views: %s", strings.Join(SupportedViews, ", "))
+	}
+	if !slices.Contains(SupportedViews, trimmed) {
+		return fmt.Errorf("invalid view %q, supported views: %s", view, strings.Join(SupportedViews, ", "))
+	}
+	return nil
+}
+
+// ValidateCommonScanFlags validates flags that are common to all scan subcommands
+func ValidateCommonScanFlags(cmd *cobra.Command, scanInfo *cautils.ScanInfo, supportedFormats []string) error {
+	if scanInfo.Submit.GetBool() && scanInfo.Local {
+		return ErrKeepLocalOrSubmit
+	}
+	if scanInfo.Submit.GetBool() && scanInfo.OmitRawResources {
+		return ErrOmitRawResourcesOrSubmit
+	}
+
+	if scanInfo.FailThresholdSeverity != "" {
+		if err := ValidateSeverity(scanInfo.FailThresholdSeverity); err != nil {
+			return err
+		}
+	}
+	if scanInfo.MinSeverity != "" {
+		if err := ValidateSeverity(scanInfo.MinSeverity); err != nil {
+			return err
+		}
+	}
+	if scanInfo.MaxSeverity != "" {
+		if err := ValidateSeverity(scanInfo.MaxSeverity); err != nil {
+			return err
+		}
+	}
+	if scanInfo.MinSeverity != "" && scanInfo.MaxSeverity != "" {
+		if err := ValidateSeverityRange(scanInfo.MinSeverity, scanInfo.MaxSeverity); err != nil {
+			return err
+		}
+	}
+	f := cmd.Flags().Lookup("format")
+	if f == nil {
+		f = cmd.InheritedFlags().Lookup("format")
+	}
+	if f != nil && f.Changed && strings.TrimSpace(scanInfo.Format) == "" {
+		return fmt.Errorf("format cannot be empty, supported formats: %s", strings.Join(supportedFormats, ", "))
+	}
+	if err := ValidateScanFormat(scanInfo.Format, supportedFormats); err != nil {
+		return err
+	}
+	if scanInfo.Format != "" {
+		scanInfo.Format = NormalizeScanFormats(scanInfo.Format)
+	}
+	fView := cmd.Flags().Lookup("view")
+	if fView == nil {
+		fView = cmd.InheritedFlags().Lookup("view")
+	}
+	if scanInfo.ScanType == cautils.ScanTypeImage {
+		if fView != nil && fView.Changed {
+			return fmt.Errorf("--view is not supported for image scans: an image scan evaluates vulnerabilities, not posture views")
+		}
+	} else {
+		if fView != nil && fView.Changed && strings.TrimSpace(scanInfo.View) == "" {
+			return fmt.Errorf("view cannot be empty, supported views: %s", strings.Join(SupportedViews, ", "))
+		}
+		if scanInfo.View != "" {
+			if err := ValidateView(scanInfo.View); err != nil {
+				return err
+			}
+			scanInfo.View = strings.ToLower(strings.TrimSpace(scanInfo.View))
+		}
+	}
+	if scanInfo.ScanImages && scanInfo.ScanType != cautils.ScanTypeImage {
+		for _, format := range strings.Split(scanInfo.Format, ",") {
+			switch strings.TrimSpace(format) {
+			case printer.GitLabSASTFormat:
+				return fmt.Errorf("gitlab-sast requires separate posture and image scans; use json or sarif for a combined scan with --scan-images")
+			case printer.GitLabCodeQualityFormat:
+				return fmt.Errorf("gitlab-codequality cannot carry image vulnerabilities; use json or sarif for a combined scan with --scan-images")
+			case printer.GitHubActionsFormat:
+				return fmt.Errorf("github-actions cannot carry image vulnerabilities; use json or sarif for a combined scan with --scan-images")
+			}
+		}
+	}
+	if scanInfo.ScanType != cautils.ScanTypeImage && !scanInfo.ScanImages {
+		for _, format := range strings.Split(scanInfo.Format, ",") {
+			f := strings.TrimSpace(format)
+			if f == printer.CycloneDXFormat || f == printer.SPDXFormat {
+				return fmt.Errorf("format %q requires scanned images: add --scan-images, or run %q to scan an image directly", f, cautils.ExecName()+" scan image")
+			}
+		}
+	}
+	if err := ValidateKindFilters(scanInfo); err != nil {
+		return err
+	}
+	if err := ValidateExcludePaths(scanInfo); err != nil {
+		return err
+	}
+	if strings.TrimSpace(scanInfo.LabelSelector) == "" && scanInfo.LabelSelector != "" {
+		return fmt.Errorf("invalid --label-selector %q: must not be whitespace-only", scanInfo.LabelSelector)
+	}
+	if scanInfo.LabelSelector != "" {
+		if _, err := labels.Parse(scanInfo.LabelSelector); err != nil {
+			return fmt.Errorf("invalid --label-selector %q: %w", scanInfo.LabelSelector, err)
+		}
+	}
+	if err := ValidateExcludeControls(scanInfo); err != nil {
+		return err
+	}
+	if scanInfo.MaxDBAge < 0 {
+		return fmt.Errorf("invalid --max-db-age %q: must be a positive duration (e.g. 120h) or 0 for the default", scanInfo.MaxDBAge)
+	}
+	if err := validateEPSSThreshold(scanInfo.EPSSThreshold); err != nil {
+		return err
+	}
+	if err := validateImageRiskGateScope(scanInfo); err != nil {
+		return err
+	}
+	ApplyDBAgeGatePresence(cmd, scanInfo)
+	return nil
+}
+
+// validateEPSSThreshold returns an error wrapping ErrBadThreshold when
+// --epss-threshold is NaN or outside [0, 1]. EPSS is a probability, so a
+// larger value could never fail a scan.
+func validateEPSSThreshold(threshold float64) error {
+	if math.IsNaN(threshold) || threshold < 0 || threshold > 1 {
+		return fmt.Errorf("%w: --epss-threshold must be between 0 and 1, got %v", ErrBadThreshold, threshold)
+	}
+	return nil
+}
+
+// validateImageRiskGateScope rejects an exploitability gate on a scan that
+// evaluates no images, where it would otherwise pass silently. A dry run stops
+// after the RBAC preflight, so it never scans images even with --scan-images.
+func validateImageRiskGateScope(scanInfo *cautils.ScanInfo) error {
+	if scanInfo.DryRun {
+		if scanInfo.FailOnKEV {
+			return fmt.Errorf("--fail-on-kev cannot be used with --dry-run: a dry run does not scan images")
+		}
+		if scanInfo.EPSSThreshold > 0 {
+			return fmt.Errorf("--epss-threshold cannot be used with --dry-run: a dry run does not scan images")
+		}
+	}
+	if scanInfo.ScanImages || scanInfo.ScanType == cautils.ScanTypeImage {
+		return nil
+	}
+	if scanInfo.FailOnKEV {
+		return fmt.Errorf("--fail-on-kev evaluates image vulnerabilities: use 'kubescape scan image' or add --scan-images")
+	}
+	if scanInfo.EPSSThreshold > 0 {
+		return fmt.Errorf("--epss-threshold evaluates image vulnerabilities: use 'kubescape scan image' or add --scan-images")
+	}
+	return nil
+}
+
+// ApplyDBAgeGatePresence records whether the DB age-gate flags were explicitly
+// passed (even false/zero) so explicit CLI values win over KS_* environment
+// fallbacks in ResolveDBAgeGate. It runs inside ValidateCommonScanFlags, which
+// every scan subcommand invokes, and is a no-op when the flags are not
+// registered on the command (e.g. unit tests with bare commands).
+func ApplyDBAgeGatePresence(cmd *cobra.Command, scanInfo *cautils.ScanInfo) {
+	if flag := cmd.Flags().Lookup("fail-on-stale-db"); flag != nil {
+		scanInfo.FailOnStaleDBSet = flag.Changed
+	} else if flag := cmd.InheritedFlags().Lookup("fail-on-stale-db"); flag != nil {
+		scanInfo.FailOnStaleDBSet = flag.Changed
+	}
+	if flag := cmd.Flags().Lookup("max-db-age"); flag != nil {
+		scanInfo.MaxDBAgeSet = flag.Changed
+	} else if flag := cmd.InheritedFlags().Lookup("max-db-age"); flag != nil {
+		scanInfo.MaxDBAgeSet = flag.Changed
+	}
+}
+
+func ValidateExcludeControls(scanInfo *cautils.ScanInfo) error {
+	for _, control := range scanInfo.ExcludeControls {
+		if strings.TrimSpace(control) == "" {
+			return fmt.Errorf("--exclude-controls contains an empty control identifier")
+		}
+	}
+	return nil
+}
+
+// ValidateExcludePaths fails the command on a malformed pattern before any resource is collected.
+func ValidateExcludePaths(scanInfo *cautils.ScanInfo) error {
+	if err := cautils.ValidateCommandLinePatterns(scanInfo.ExcludePaths); err != nil {
+		return fmt.Errorf("--exclude-path: %w", err)
+	}
+	return nil
+}
+
+// ValidateKindFilters returns an error when --include-kinds or --exclude-kinds
+// contain only whitespace tokens, which would silently discard every resource.
+func ValidateKindFilters(scanInfo *cautils.ScanInfo) error {
+	if err := validateKindList("--include-kinds", scanInfo.IncludeKinds); err != nil {
+		return err
+	}
+	return validateKindList("--exclude-kinds", scanInfo.ExcludeKinds)
+}
+
+func validateKindList(flag, value string) error {
+	if value == "" {
+		return nil
+	}
+	for _, k := range strings.Split(value, ",") {
+		if strings.TrimSpace(k) != "" {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s value %q contains no valid kind names", flag, value)
+}

@@ -1,0 +1,116 @@
+# regal ignore:directory-package-mismatch
+package armo_builtins
+
+import rego.v1
+
+deny contains msga if {
+	verbs := ["update", "patch", "*"]
+	api_groups := ["", "*"]
+	resources := ["pods", "*"]
+	subjectVector := input[_]
+	role := subjectVector.relatedObjects[i]
+	rolebinding := subjectVector.relatedObjects[j]
+	endswith(role.kind, "Role")
+	endswith(rolebinding.kind, "Binding")
+
+	rolebinding.roleRef.kind == role.kind
+	rolebinding.roleRef.name == role.metadata.name
+	is_same_namespace(role, rolebinding)
+	affects_privileged_namespace(rolebinding)
+
+	rule := role.rules[p]
+
+	# a rule restricted to named pods cannot be pointed at an arbitrary privileged pod
+	# (an omitted or explicitly empty resourceNames list is unrestricted)
+	count(resource_names(rule)) == 0
+
+	subject := rolebinding.subjects[k]
+	is_same_subjects(subjectVector, subject)
+
+	rule_path := sprintf("relatedObjects[%d].rules[%d]", [i, p])
+
+	verb_path := [sprintf("%s.verbs[%d]", [rule_path, l]) | verb = rule.verbs[l]; verb in verbs]
+	count(verb_path) > 0
+
+	api_groups_path := [sprintf("%s.apiGroups[%d]", [rule_path, a]) | apiGroup = rule.apiGroups[a]; apiGroup in api_groups]
+	count(api_groups_path) > 0
+
+	resources_path := [sprintf("%s.resources[%d]", [rule_path, l]) | resource = rule.resources[l]; resource in resources]
+	count(resources_path) > 0
+
+	path := array.concat(resources_path, verb_path)
+	path2 := array.concat(path, api_groups_path)
+	finalpath := array.concat(path2, [
+		sprintf("relatedObjects[%d].roleRef.name", [j]),
+		sprintf("relatedObjects[%d].subjects[%d]", [j, k]),
+	])
+
+	msga := {
+		"alertMessage": sprintf("Subject: %s-%s can modify pods in privileged namespaces", [subjectVector.kind, subjectVector.name]),
+		"alertScore": 7,
+		"packagename": "armo_builtins",
+		"reviewPaths": finalpath,
+		"failedPaths": finalpath,
+		"fixPaths": [],
+		"alertObject": {
+			"k8sApiObjects": [],
+			"externalObjects": subjectVector,
+		},
+	}
+}
+
+# a ClusterRoleBinding grants the role in every namespace, privileged ones included
+affects_privileged_namespace(rolebinding) if {
+	rolebinding.kind == "ClusterRoleBinding"
+}
+
+# a RoleBinding only grants the role inside its own namespace. Namespaces are
+# listed inline because a package level constant would be evaluated as a rule
+# response by the rego processor.
+affects_privileged_namespace(rolebinding) if {
+	rolebinding.kind == "RoleBinding"
+	rolebinding.metadata.namespace in {"kube-system"}
+}
+
+is_same_namespace(role, rolebinding) if {
+	role.kind == "ClusterRole"
+}
+
+is_same_namespace(role, rolebinding) if {
+	role.kind == "Role"
+	role.metadata.namespace == rolebinding.metadata.namespace
+}
+
+is_same_subjects(subjectVector, subject) if {
+	subjectVector.kind == subject.kind
+	subjectVector.name == subject.name
+	subjectVector.namespace == subject.namespace
+}
+
+is_same_subjects(subjectVector, subject) if {
+	subjectVector.kind == subject.kind
+	subjectVector.name == subject.name
+	subjectVector.apiGroup == subject.apiGroup
+}
+
+# A subject can carry neither qualifier. A ServiceAccount subject of a
+# RoleBinding may leave out its namespace, which the authorizer then reads as
+# the binding's own, and its apiGroup is empty, so the API server returns the
+# subject with neither field set. A User or Group manifest may also leave out
+# apiGroup, which the API server defaults. Both clauses above need one of the
+# fields to be present, so read them with a default here instead.
+is_same_subjects(subjectVector, subject) if {
+	subjectVector.kind == subject.kind
+	subjectVector.name == subject.name
+	object.get(subjectVector, "namespace", "") == object.get(subject, "namespace", "")
+	object.get(subjectVector, "apiGroup", "") == object.get(subject, "apiGroup", "")
+}
+
+# resource_names is a rule's resourceNames with an absent or null list read as
+# the empty list. Kubernetes treats all three alike: ResourceNameMatches matches
+# as soon as the list is empty, so the rule is not narrowed to named objects.
+# Counting a null list directly is undefined and would drop the rule instead.
+resource_names(rule) := names if {
+	names := object.get(rule, "resourceNames", [])
+	names != null
+} else := []

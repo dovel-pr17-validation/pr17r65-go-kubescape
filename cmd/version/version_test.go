@@ -1,0 +1,278 @@
+package version
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"strings"
+	"testing"
+
+	"github.com/kubescape/backend/pkg/versioncheck"
+	"github.com/kubescape/kubescape/v4/core/core"
+	"github.com/kubescape/kubescape/v4/core/mocks"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"sigs.k8s.io/yaml"
+)
+
+type errorWriter struct {
+	err error
+}
+
+func (w errorWriter) Write([]byte) (int, error) {
+	return 0, w.err
+}
+
+func TestGetVersionCmd_TextOutput(t *testing.T) {
+	t.Setenv("KS_SKIP_UPDATE_CHECK", "true")
+	t.Setenv("FORCE_COLOR", "0")
+
+	tests := []struct {
+		name        string
+		buildNumber string
+		args        []string
+		want        string
+	}{
+		{
+			name:        "default (no flag)",
+			buildNumber: "unknown",
+			args:        nil,
+			want:        "Your current version is: unknown\nBuild commit: \nBuild date: \n",
+		},
+		{
+			name:        "explicit --format text",
+			buildNumber: "v3.0.1",
+			args:        []string{"--format", "text"},
+			want:        "Your current version is: v3.0.1\nBuild commit: \nBuild date: \n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			versioncheck.BuildNumber = tt.buildNumber
+
+			ks := core.NewKubescape(context.Background())
+			cmd := GetVersionCmd(ks, tt.buildNumber, "", "")
+			require.NotNil(t, cmd)
+
+			buf := bytes.NewBufferString("")
+			cmd.SetOut(buf)
+			if tt.args != nil {
+				cmd.SetArgs(tt.args)
+			}
+			require.NoError(t, cmd.Execute())
+
+			out, err := io.ReadAll(buf)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, string(out))
+		})
+	}
+}
+
+func TestGetVersionCmd_JSONOutput(t *testing.T) {
+	t.Setenv("KS_SKIP_UPDATE_CHECK", "true")
+
+	tests := []struct {
+		name    string
+		version string
+		commit  string
+		date    string
+	}{
+		{
+			name:    "all fields populated",
+			version: "v3.0.1",
+			commit:  "abc123",
+			date:    "2024-01-15",
+		},
+		{
+			name:    "empty commit and date",
+			version: "v3.2.0",
+			commit:  "",
+			date:    "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			versioncheck.BuildNumber = tt.version
+
+			ks := core.NewKubescape(context.Background())
+			cmd := GetVersionCmd(ks, tt.version, tt.commit, tt.date)
+			require.NotNil(t, cmd)
+
+			buf := bytes.NewBufferString("")
+			cmd.SetOut(buf)
+			cmd.SetArgs([]string{"--format", "json"})
+			require.NoError(t, cmd.Execute())
+
+			out, err := io.ReadAll(buf)
+			require.NoError(t, err)
+
+			var got versionInfo
+			require.NoError(t, json.Unmarshal(out, &got))
+			assert.Equal(t, tt.version, got.Version)
+			assert.Equal(t, tt.commit, got.Commit)
+			assert.Equal(t, tt.date, got.Date)
+		})
+	}
+}
+
+func TestGetVersionCmd_YAMLOutput(t *testing.T) {
+	t.Setenv("KS_SKIP_UPDATE_CHECK", "true")
+
+	tests := []struct {
+		name    string
+		version string
+		commit  string
+		date    string
+	}{
+		{
+			name:    "all fields populated",
+			version: "v3.0.1",
+			commit:  "abc123",
+			date:    "2024-01-15",
+		},
+		{
+			name:    "empty commit and date",
+			version: "v3.2.0",
+			commit:  "",
+			date:    "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			versioncheck.BuildNumber = tt.version
+
+			ks := core.NewKubescape(context.Background())
+			cmd := GetVersionCmd(ks, tt.version, tt.commit, tt.date)
+			require.NotNil(t, cmd)
+
+			buf := bytes.NewBufferString("")
+			cmd.SetOut(buf)
+			cmd.SetArgs([]string{"--format", "yaml"})
+			require.NoError(t, cmd.Execute())
+
+			out, err := io.ReadAll(buf)
+			require.NoError(t, err)
+
+			var got versionInfo
+			require.NoError(t, yaml.Unmarshal(out, &got))
+			assert.Equal(t, tt.version, got.Version)
+			assert.Equal(t, tt.commit, got.Commit)
+			assert.Equal(t, tt.date, got.Date)
+		})
+	}
+}
+
+func TestGetVersionCmd_FormatFlagRegistered(t *testing.T) {
+	ks := core.NewKubescape(context.Background())
+	cmd := GetVersionCmd(ks, "v3.0.0", "", "")
+	require.NotNil(t, cmd)
+
+	f := cmd.Flags().Lookup("format")
+	require.NotNil(t, f, "--format flag must be registered on the version command")
+	assert.Equal(t, "text", f.DefValue, "--format default must be text")
+}
+
+func TestGetVersionCmd_InvalidFormat(t *testing.T) {
+	t.Setenv("KS_SKIP_UPDATE_CHECK", "true")
+
+	ks := core.NewKubescape(context.Background())
+	cmd := GetVersionCmd(ks, "v3.0.0", "", "")
+	require.NotNil(t, cmd)
+
+	cmd.SetArgs([]string{"--format", "xml"})
+	err := cmd.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported format")
+	assert.Contains(t, err.Error(), "xml")
+}
+
+func TestGetVersionCmd_TextWriterError(t *testing.T) {
+	t.Setenv("KS_SKIP_UPDATE_CHECK", "true")
+
+	wantErr := errors.New("write failed")
+	ks := core.NewKubescape(context.Background())
+	cmd := GetVersionCmd(ks, "v3.0.0", "abc123", "2026-08-13")
+	cmd.SetOut(errorWriter{err: wantErr})
+
+	err := cmd.Execute()
+	require.ErrorIs(t, err, wantErr)
+}
+
+func TestGetVersionCmd_RejectsUnexpectedArgs(t *testing.T) {
+	ks := core.NewKubescape(context.Background())
+	cmd := GetVersionCmd(ks, "v3.0.0", "", "")
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	cmd.SetArgs([]string{"unexpected"})
+
+	err := cmd.Execute()
+	require.Error(t, err)
+}
+
+func TestGetVersionCmd_CaseInsensitiveFormat(t *testing.T) {
+	t.Setenv("KS_SKIP_UPDATE_CHECK", "true")
+
+	formats := []string{"JSON", "Json", "TEXT", "Text", "YAML", "Yaml", " json ", " text ", " yaml "}
+	for _, f := range formats {
+		t.Run("format_"+strings.TrimSpace(f), func(t *testing.T) {
+			ks := core.NewKubescape(context.Background())
+			cmd := GetVersionCmd(ks, "v3.0.0", "abc123", "2026-08-13")
+			var buf bytes.Buffer
+			cmd.SetOut(&buf)
+			cmd.SetArgs([]string{"--format", f})
+			assert.NoError(t, cmd.Execute())
+			assert.NotEmpty(t, buf.String())
+		})
+	}
+}
+
+func TestGetVersionCmd_EmptyFormat(t *testing.T) {
+	t.Setenv("KS_SKIP_UPDATE_CHECK", "true")
+
+	formats := []string{"", "   "}
+	for _, f := range formats {
+		t.Run("format_empty", func(t *testing.T) {
+			ks := core.NewKubescape(context.Background())
+			cmd := GetVersionCmd(ks, "v3.0.0", "", "")
+			cmd.SetArgs([]string{"--format", f})
+			err := cmd.Execute()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "format cannot be empty, supported formats: text, json, yaml")
+		})
+	}
+}
+
+func TestGetVersionCmd_NilKubescape(t *testing.T) {
+	cmd := GetVersionCmd(nil, "v3.0.0", "", "")
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	cmd.SetArgs([]string{})
+
+	err := cmd.Execute()
+	require.EqualError(t, err, "uninitialized kubescape interface")
+}
+
+type stubNilContextKubescape struct {
+	mocks.MockIKubescape
+}
+
+func (s *stubNilContextKubescape) Context() context.Context {
+	return nil
+}
+
+func TestGetVersionCmd_NilContextFallback(t *testing.T) {
+	t.Setenv("KS_SKIP_UPDATE_CHECK", "true")
+	t.Setenv("FORCE_COLOR", "0")
+
+	cmd := GetVersionCmd(&stubNilContextKubescape{}, "v3.0.0", "abc1234", "2026-11-05")
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	err := cmd.Execute()
+	require.NoError(t, err)
+	assert.Contains(t, buf.String(), "Your current version is: v3.0.0")
+}

@@ -1,0 +1,487 @@
+package core
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
+	"github.com/kubescape/go-logger"
+	"github.com/kubescape/go-logger/helpers"
+	metav1 "github.com/kubescape/kubescape/v4/core/meta/datastructures/v1"
+	"github.com/kubescape/kubescape/v4/core/pkg/fixhandler"
+	"github.com/mattn/go-isatty"
+)
+
+const (
+	noChangesApplied     = "No changes were applied."
+	noResourcesToFix     = "No issues to fix."
+	confirmationQuestion = "Would you like to apply the changes to the files above? [y|n]: "
+
+	// maxConfirmRetries bounds retries on a read error we don't recognize as
+	// permanent, so any stdin state the isTerminal check doesn't catch still
+	// can't turn into the unbounded hot loop from #2711.
+	maxConfirmRetries = 100
+
+	nonInteractiveWarning = "stdin is not interactive; treating the fix confirmation as declined and applying no changes (pass --no-confirm to apply without a prompt)"
+	stdinClosedWarning    = "stdin was closed before a confirmation was given; treating the fix confirmation as declined and applying no changes (pass --no-confirm to apply without a prompt)"
+)
+
+// isTerminal and isCygwinTerminal are vars (not direct isatty calls) so tests
+// can stub them. Both must be checked: on Windows under mintty (Git Bash,
+// MSYS2), stdin is a named pipe rather than a console, so IsTerminal alone
+// returns false for a real interactive session — IsCygwinTerminal is the
+// isatty-recommended way to detect that case.
+var (
+	isTerminal       = isatty.IsTerminal
+	isCygwinTerminal = isatty.IsCygwinTerminal
+)
+
+func (ks *Kubescape) Fix(fixInfo *metav1.FixInfo) error {
+	if fixInfo == nil {
+		return errors.New("uninitialized fix parameters")
+	}
+	if strings.TrimSpace(fixInfo.ReportFile) == "" {
+		return errors.New("report output file is required")
+	}
+	if err := fixInfo.ValidateOutputDir(); err != nil {
+		return err
+	}
+	if err := fixInfo.ValidateKustomizeDir(); err != nil {
+		return err
+	}
+	if err := fixInfo.ValidateBasePath(); err != nil {
+		return err
+	}
+	if err := fixInfo.ValidatePostRendererDir(); err != nil {
+		return err
+	}
+	if err := fixInfo.ValidateContainerProfilePath(); err != nil {
+		return err
+	}
+	// Before anything is read: a patch or a verification combined with another
+	// output mode must fail, not quietly do one of the two.
+	if err := fixInfo.ValidateOutputPatch(); err != nil {
+		return err
+	}
+	if err := fixInfo.ValidateVerify(); err != nil {
+		return err
+	}
+
+	fixInfo.ReportFile = strings.TrimSpace(fixInfo.ReportFile)
+	fixInfo.OutputDir = strings.TrimSpace(fixInfo.OutputDir)
+	fixInfo.OutputPatch = strings.TrimSpace(fixInfo.OutputPatch)
+	fixInfo.KustomizeDir = strings.TrimSpace(fixInfo.KustomizeDir)
+	fixInfo.PostRendererDir = strings.TrimSpace(fixInfo.PostRendererDir)
+	fixInfo.BasePath = strings.TrimSpace(fixInfo.BasePath)
+	fixInfo.ContainerProfilePath = strings.TrimSpace(fixInfo.ContainerProfilePath)
+	fixInfo.ControlsConfig = strings.TrimSpace(fixInfo.ControlsConfig)
+
+	logger.L().Info("Reading report file...")
+	handler, err := fixhandler.NewFixHandler(fixInfo)
+	if err != nil {
+		return err
+	}
+	if fixInfo.Verify && handler.IsClusterReport() {
+		return errors.New("--verify rescans manifest files, and a cluster scan has none; fix the manifests that created the resources and scan them again")
+	}
+
+	resourcesToFix := handler.PrepareResourcesToFix(ks.Context())
+	helmSuggestions := handler.PrepareHelmSuggestions(ks.Context())
+
+	if len(resourcesToFix) == 0 && len(helmSuggestions) == 0 {
+		logger.L().Info(noResourcesToFix)
+		// Without this a report whose resources were all skipped reads as a
+		// clean bill of health rather than a set of findings nothing handled.
+		handler.PrintUnfixedControls(fixhandler.PhasePlanned)
+		skipVerification(fixInfo)
+		return nil
+	}
+
+	// A verification that could not run as the original scan did must say so
+	// before anything is written, not after: before the manifests are changed,
+	// and before the Kustomize output below. Without a fix to apply there is
+	// nothing to verify, so nothing is refused.
+	if fixInfo.Verify && len(resourcesToFix) > 0 {
+		if _, _, err := verificationConfig(handler.RecordedControlsInputs(), fixInfo.ControlsConfig); err != nil {
+			return err
+		}
+	}
+
+	// Helm guidance is print-only — applied to none of the apply/confirm
+	// path below, since we do not auto-edit chart templates or values.yaml.
+	handler.PrintHelmSuggestions(helmSuggestions)
+
+	// A report can hold both manifests and Helm resources, so the Kustomize
+	// output below can be written before writePatch runs. Refuse an unusable
+	// patch destination first, so nothing is written when the export is going
+	// to fail. writePatch checks it again; it does not rely on this.
+	if fixInfo.OutputPatch != "" && len(resourcesToFix) > 0 && !handler.IsClusterReport() {
+		if err := handler.CheckPatchDestination(fixInfo.OutputPatch, resourcesToFix, fixInfo.NoConfirm); err != nil {
+			return err
+		}
+	}
+
+	// Emit Kustomize JSON 6902 patches when --output-kustomize is given.
+	// This is a machine-applicable companion to PrintHelmSuggestions: the
+	// generated patches can be applied via:
+	//   kustomize build <dir> | kubectl apply -f -
+	if fixInfo.KustomizeDir != "" && !fixInfo.DryRun {
+		if fixInfo.BasePath != "" {
+			for i := range helmSuggestions {
+				if helmSuggestions[i].AllowedBasePath == "" {
+					helmSuggestions[i].AllowedBasePath = fixInfo.BasePath
+				}
+			}
+		}
+		if !fixInfo.HelmValueOptions.IsEmpty() {
+			for i := range helmSuggestions {
+				if helmSuggestions[i].HelmValueOptions.IsEmpty() {
+					helmSuggestions[i].HelmValueOptions = fixInfo.HelmValueOptions
+				}
+			}
+		}
+
+		skipKustomize := false
+		kustomizeConfirmed := fixInfo.NoConfirm
+		chartCache := fixhandler.NewChartCache()
+		if !fixInfo.NoConfirm && fixhandler.HasEmittableKustomizePatches(helmSuggestions, chartCache) {
+			if entries, err := os.ReadDir(fixInfo.KustomizeDir); err == nil && len(entries) > 0 {
+				hasKustFile := false
+				plannedFiles := fixhandler.PlannedKustomizeFiles(helmSuggestions, chartCache)
+				plannedMap := make(map[string]bool, len(plannedFiles))
+				for _, pf := range plannedFiles {
+					plannedMap[pf] = true
+				}
+				for _, e := range entries {
+					name := e.Name()
+					if name == "kustomization.yaml" || name == "base.yaml" || plannedMap[name] || strings.HasSuffix(name, "-patch.yaml") {
+						hasKustFile = true
+						break
+					}
+				}
+				if hasKustFile {
+					fd := os.Stdin.Fd()
+					if isTerminal(fd) || isCygwinTerminal(fd) {
+						fmt.Fprintf(os.Stderr, "Directory %q already contains Kustomize files. Overwrite? [y/N]: ", fixInfo.KustomizeDir)
+						var resp string
+						if _, err := fmt.Fscanln(os.Stdin, &resp); err != nil || !isAffirmative(resp) {
+							logger.L().Info("Kustomize patch generation cancelled by user.")
+							skipKustomize = true
+						} else {
+							kustomizeConfirmed = true
+						}
+					} else {
+						return fmt.Errorf("directory %q already contains Kustomize files; pass --no-confirm to overwrite them", fixInfo.KustomizeDir)
+					}
+				}
+			}
+		}
+
+		if !skipKustomize {
+			emitRes, err := fixhandler.EmitKustomizePatch(helmSuggestions, fixInfo.KustomizeDir, fixhandler.WithOverwrite(kustomizeConfirmed), fixhandler.WithChartCache(chartCache))
+			if err != nil {
+				logger.L().Error("failed to write Kustomize patches", helpers.Error(err))
+				return fmt.Errorf("failed to write Kustomize patches: %w", err)
+			}
+			if emitRes != nil {
+				for _, skipped := range emitRes.SkippedResources {
+					logger.L().Warning(fmt.Sprintf("skipped Kustomize patch generation for %s: %s", skipped.ResourceKey, skipped.Reason))
+				}
+				if len(emitRes.EmittedResources) > 0 {
+					logger.L().Info(fmt.Sprintf(
+						"Kustomize patches written to %q\n  Apply with: kustomize build %s | kubectl apply -f -",
+						fixInfo.KustomizeDir, fixInfo.KustomizeDir,
+					))
+				} else if len(emitRes.SkippedResources) > 0 {
+					logger.L().Info("No Kustomize patches were emitted (all resources were declined or skipped). Note: ordinary scan reports redact container environment configuration; container resources are declined without programmatic provenance (UnredactedBase or FidelityProvenance), which is not supplied through the ordinary producer.")
+				}
+			}
+
+			if fixInfo.PostRendererDir != "" {
+				if emitRes == nil || len(emitRes.EmittedResources) == 0 {
+					logger.L().Warning("--output-post-renderer: no Kustomize patches were emitted; skipping post-renderer script emission")
+				} else {
+					if err := fixhandler.EmitPostRenderer(fixInfo.KustomizeDir, fixInfo.PostRendererDir); err != nil {
+						logger.L().Error("failed to write post-renderer scripts", helpers.Error(err))
+						return fmt.Errorf("failed to write post-renderer scripts: %w", err)
+					}
+					logger.L().Info(fmt.Sprintf(
+						"Helm post-renderer script written to %q\n  Apply with: helm install <release> <chart> --post-renderer %s/renderer.sh",
+						fixInfo.PostRendererDir, fixInfo.PostRendererDir,
+					))
+				}
+			}
+		}
+	} else if fixInfo.PostRendererDir != "" && !fixInfo.DryRun {
+		logger.L().Warning("--output-post-renderer was passed without --output-kustomize; skipping post-renderer script emission (requires Kustomize patches)")
+	}
+
+	if len(resourcesToFix) == 0 {
+		logger.L().Info(noResourcesToFix)
+		// Even with nothing to auto-fix, surface controls that still need manual remediation.
+		handler.PrintUnfixedControls(fixhandler.PhasePlanned)
+		skipVerification(fixInfo)
+		return nil
+	}
+
+	if !fixInfo.Interactive {
+		handler.PrintExpectedChanges(resourcesToFix)
+	}
+
+	if fixInfo.DryRun {
+		if fixInfo.Interactive {
+			handler.PrintExpectedChanges(resourcesToFix)
+		}
+		logger.L().Info(noChangesApplied)
+		handler.PrintUnfixedControls(fixhandler.PhasePlanned)
+		return nil
+	}
+
+	// A cluster scan has no manifests to rewrite, so its fixes are rendered
+	// from the scanned objects and emitted for the user to apply. This sits
+	// after the dry-run check (which is identical either way) and before the
+	// confirmation prompt, which exists to guard in-place edits that this path
+	// never makes.
+	if handler.IsClusterReport() {
+		if fixInfo.OutputPatch != "" {
+			return errors.New("--output-patch exports changes to manifest files, and a cluster scan has none; use --output-dir to write one patched manifest per resource")
+		}
+		if fixInfo.Interactive {
+			handler.PrintExpectedChanges(resourcesToFix)
+		}
+		return ks.emitClusterFixes(handler, resourcesToFix, fixInfo)
+	}
+
+	// --output-dir turns the in-place fix into fixed copies. Like the cluster
+	// path it sits before the confirmation prompt: the prompt guards edits to
+	// the user's own manifests, and this path makes none.
+	if fixInfo.OutputDir != "" {
+		if fixInfo.Interactive {
+			handler.PrintExpectedChanges(resourcesToFix)
+		}
+		return ks.writeFixedCopies(handler, resourcesToFix, fixInfo)
+	}
+
+	// --output-patch exports the same fixes as one unified diff. It sits before
+	// the confirmation prompt for the same reason: no manifest is edited.
+	if fixInfo.OutputPatch != "" {
+		if fixInfo.Interactive {
+			handler.PrintExpectedChanges(resourcesToFix)
+		}
+		return ks.writePatch(handler, resourcesToFix, fixInfo)
+	}
+
+	if fixInfo.Interactive && !fixInfo.NoConfirm {
+		var acceptedResources []fixhandler.ResourceFixInfo
+		var declinedResources []fixhandler.ResourceFixInfo
+		for _, r := range resourcesToFix {
+			handler.PrintExpectedChanges([]fixhandler.ResourceFixInfo{r})
+			if userConfirmed() {
+				acceptedResources = append(acceptedResources, r)
+			} else {
+				declinedResources = append(declinedResources, r)
+			}
+		}
+		if len(declinedResources) > 0 {
+			handler.DeclineResources(declinedResources)
+		}
+		if len(acceptedResources) == 0 {
+			logger.L().Info(noChangesApplied)
+			handler.PrintUnfixedControls(fixhandler.PhasePlanned)
+			skipVerification(fixInfo)
+			return nil
+		}
+		resourcesToFix = acceptedResources
+	} else {
+		if fixInfo.Interactive && fixInfo.NoConfirm {
+			handler.PrintExpectedChanges(resourcesToFix)
+		}
+		if !fixInfo.NoConfirm && !userConfirmed() {
+			logger.L().Info(noChangesApplied)
+			handler.PrintUnfixedControls(fixhandler.PhasePlanned)
+			skipVerification(fixInfo)
+			return nil
+		}
+	}
+
+	plannedFiles := make(map[string]bool, len(resourcesToFix))
+	for _, r := range resourcesToFix {
+		plannedFiles[r.FilePath] = true
+	}
+	plannedFilesCount := len(plannedFiles)
+
+	updatedFilesCount, errors := handler.ApplyChanges(ks.Context(), resourcesToFix)
+	plannedControls := handler.FixedControlsCount()
+	totalFailed := plannedControls + len(handler.UnfixedControls())
+
+	// "Auto-fixed" is only honest when every planned file actually wrote.
+	// Otherwise (apply errors, partial writes) we report planning numbers and
+	// flag the discrepancy.
+	fullySucceeded := updatedFilesCount == plannedFilesCount && len(errors) == 0
+	if fullySucceeded {
+		logger.L().Info(fmt.Sprintf("Fixed %d of %d flagged control instances across %d file(s).",
+			plannedControls, totalFailed, updatedFilesCount))
+		handler.PrintUnfixedControls(fixhandler.PhaseApplied)
+	} else {
+		logger.L().Info(fmt.Sprintf(
+			"Planned fixes for %d of %d flagged control instances across %d file(s); applied to %d file(s) — the remaining files errored, see warnings below.",
+			plannedControls, totalFailed, plannedFilesCount, updatedFilesCount))
+		handler.PrintUnfixedControls(fixhandler.PhasePlanned)
+	}
+
+	if len(errors) > 0 {
+		for _, err := range errors {
+			logger.L().Ctx(ks.Context()).Warning("failed to fix resource", helpers.Error(err))
+		}
+		if fixInfo.Verify {
+			logger.L().Info("Verification skipped: not every fix was applied.")
+		}
+		return fmt.Errorf("failed to fix some resources, check the logs for more details")
+	}
+
+	if fixInfo.Verify {
+		return ks.verifyFixes(handler, fixInfo)
+	}
+	return nil
+}
+
+// skipVerification says why --verify did nothing when no fix was applied.
+func skipVerification(fixInfo *metav1.FixInfo) {
+	if fixInfo.Verify {
+		logger.L().Info(noFixesToVerify)
+	}
+}
+
+// writeFixedCopies fixes a file-based report into --output-dir instead of in
+// place: every manifest that would have been rewritten is written, fixed, to
+// the same relative path under the directory, and the originals are left alone.
+func (ks *Kubescape) writeFixedCopies(handler *fixhandler.FixHandler, resourcesToFix []fixhandler.ResourceFixInfo, fixInfo *metav1.FixInfo) error {
+	// Planned before the directory is touched. An output directory that is the
+	// scanned one is refused here with the reason; checked after
+	// prepareOutputDir it would be reported as "not empty; pass --no-confirm",
+	// advice that leads straight to overwriting the originals.
+	outputPaths, err := handler.OutputPaths(resourcesToFix)
+	if err != nil {
+		return err
+	}
+
+	if err := prepareOutputDir(fixInfo.OutputDir, fixInfo.NoConfirm); err != nil {
+		return err
+	}
+
+	writtenFilesCount, errors := handler.ApplyChanges(ks.Context(), resourcesToFix)
+	plannedControls := handler.FixedControlsCount()
+	totalFailed := plannedControls + len(handler.UnfixedControls())
+
+	if writtenFilesCount == len(outputPaths) && len(errors) == 0 {
+		logger.L().Info(fmt.Sprintf("Wrote %d fixed file(s) to %s, covering %d of %d flagged control instances. The original files were not modified.",
+			writtenFilesCount, fixInfo.OutputDir, plannedControls, totalFailed))
+	} else {
+		logger.L().Info(fmt.Sprintf(
+			"Planned fixes for %d of %d flagged control instances across %d file(s); wrote %d file(s) to %s — the remaining files errored, see warnings below. The original files were not modified.",
+			plannedControls, totalFailed, len(outputPaths), writtenFilesCount, fixInfo.OutputDir))
+	}
+
+	// PhasePlanned, not PhaseApplied: the copies are proposals. The manifests
+	// the scan read are unchanged, and saying "auto-fixed" would claim otherwise.
+	handler.PrintUnfixedControls(fixhandler.PhasePlanned)
+
+	if len(errors) > 0 {
+		for _, err := range errors {
+			logger.L().Ctx(ks.Context()).Warning("failed to fix resource", helpers.Error(err))
+		}
+		return fmt.Errorf("failed to fix some resources, check the logs for more details")
+	}
+
+	return nil
+}
+
+// writePatch exports the fixes of a file-based report to --output-patch as one
+// unified diff, leaving every manifest as it is. The destination is checked
+// before the fixes are computed and again before the write, and nothing is
+// written when no manifest would change or when any one fails to be fixed.
+func (ks *Kubescape) writePatch(handler *fixhandler.FixHandler, resourcesToFix []fixhandler.ResourceFixInfo, fixInfo *metav1.FixInfo) error {
+	if err := handler.CheckPatchDestination(fixInfo.OutputPatch, resourcesToFix, fixInfo.NoConfirm); err != nil {
+		return err
+	}
+
+	result, err := handler.BuildPatch(ks.Context(), resourcesToFix)
+	if err != nil {
+		return fmt.Errorf("no patch was written: %w", err)
+	}
+
+	// PhasePlanned, not PhaseApplied: a patch is a proposal. The manifests are
+	// unchanged, and saying "auto-fixed" would claim otherwise.
+	if result.Patch == "" {
+		logger.L().Info("No manifest would change, so no patch was written.")
+		handler.PrintUnfixedControls(fixhandler.PhasePlanned)
+		return nil
+	}
+
+	if err := handler.CheckPatchDestination(fixInfo.OutputPatch, resourcesToFix, fixInfo.NoConfirm); err != nil {
+		return err
+	}
+	if err := fixhandler.WritePatch(fixInfo.OutputPatch, result.Patch); err != nil {
+		return err
+	}
+
+	plannedControls := handler.FixedControlsCount()
+	totalFailed := plannedControls + len(handler.UnfixedControls())
+	logger.L().Info(fmt.Sprintf("Wrote a patch changing %d file(s) and %d resource(s) to %s, covering %d of %d flagged control instances. The original files were not modified.\n  Review it, then apply it from the scanned directory (the repository root inside git) with: git apply %s",
+		result.Files, result.Resources, fixInfo.OutputPatch, plannedControls, totalFailed, fixInfo.OutputPatch))
+	handler.PrintUnfixedControls(fixhandler.PhasePlanned)
+	return nil
+}
+
+func userConfirmed() bool {
+	fd := os.Stdin.Fd()
+	if !isTerminal(fd) && !isCygwinTerminal(fd) {
+		// Non-interactive stdin (closed, /dev/null, a redirected file, a pipe
+		// whose reads fail outright, ...) will never produce an answer: no
+		// amount of retrying fmt.Scanln fixes that. Treat it as a decline up
+		// front instead of ever entering the retry loop.
+		logger.L().Warning(nonInteractiveWarning)
+		return false
+	}
+	return confirm(os.Stdin)
+}
+
+// confirm reads y/n answers from in, reprompting on unparseable input (e.g. a
+// bare Enter). It is bounded and treats EOF as a decline so a read that can
+// never succeed can't turn into an unbounded retry loop (#2711).
+func confirm(in io.Reader) bool {
+	var input string
+
+	for attempt := 0; attempt < maxConfirmRetries; attempt++ {
+		fmt.Println(confirmationQuestion)
+		if _, err := fmt.Fscanln(in, &input); err != nil {
+			if errors.Is(err, io.EOF) {
+				logger.L().Warning(stdinClosedWarning)
+				return false
+			}
+			continue
+		}
+
+		switch strings.ToLower(input) {
+		case "y", "yes":
+			return true
+		case "n", "no":
+			return false
+		}
+	}
+
+	logger.L().Warning("no valid confirmation received after repeated attempts; treating as declined and applying no changes")
+	return false
+}
+
+// isAffirmative reports whether resp is an affirmative confirmation ("y" or "yes", case-insensitive).
+func isAffirmative(resp string) bool {
+	switch strings.ToLower(strings.TrimSpace(resp)) {
+	case "y", "yes":
+		return true
+	default:
+		return false
+	}
+}

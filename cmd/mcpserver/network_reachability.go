@@ -1,0 +1,230 @@
+package mcpserver
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+
+	"github.com/kubescape/k8s-interface/workloadinterface"
+	"github.com/kubescape/kubescape/v4/core/pkg/networkpolicy"
+	"github.com/mark3labs/mcp-go/mcp"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+)
+
+var networkPolicyGVR = schema.GroupVersionResource{Group: "networking.k8s.io", Version: "v1", Resource: "networkpolicies"}
+var namespaceGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "namespaces"}
+var podGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
+
+// createNetworkReachabilityTools registers analyze_network_reachability, a
+// real reachability query (not a policy-existence check) answering whether
+// a specific source pod can reach a specific destination pod, evaluating
+// every NetworkPolicy in the cluster the same way the Kubernetes API's own
+// semantics compose them. See core/pkg/networkpolicy for the model.
+func createNetworkReachabilityTools(ksServer *KubescapeMcpserver) {
+	tool := mcp.NewTool(
+		"analyze_network_reachability",
+		mcp.WithDescription("Determine whether a specific source pod can reach a specific destination pod (optionally on a given port/protocol), by evaluating every NetworkPolicy in the cluster together -- not just whether a blocking policy exists. Reports allowed, denied, or unknown (when a rule cannot be resolved statically, e.g. a named container port or an IP-block peer, or when a pod on the host network is involved, which most network plugins do not apply NetworkPolicy to) with the specific policy responsible."),
+		mcp.WithString("source_namespace", mcp.Required(), mcp.Description("Namespace of the source pod")),
+		mcp.WithString("source_pod", mcp.Required(), mcp.Description("Name of the source pod")),
+		mcp.WithString("destination_namespace", mcp.Required(), mcp.Description("Namespace of the destination pod")),
+		mcp.WithString("destination_pod", mcp.Required(), mcp.Description("Name of the destination pod")),
+		mcp.WithNumber("port", mcp.Description("Destination port to check (optional; omit to check whether any port/protocol pair is allowed by both source egress and destination ingress)")),
+		mcp.WithString("protocol", mcp.Description("Protocol for the port check: TCP, UDP, or SCTP (optional, defaults to TCP when port is supplied; ignored when port is omitted, which checks all three protocols)")),
+	)
+
+	ksServer.s.AddTool(tool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args, ok := request.Params.Arguments.(map[string]any)
+		if !ok || args == nil {
+			args = map[string]any{}
+		}
+
+		srcNS, toolErr := mcpRequiredStringArg(args, "source_namespace")
+		if toolErr != nil {
+			return toolErr, nil
+		}
+		srcName, toolErr := mcpRequiredStringArg(args, "source_pod")
+		if toolErr != nil {
+			return toolErr, nil
+		}
+		dstNS, toolErr := mcpRequiredStringArg(args, "destination_namespace")
+		if toolErr != nil {
+			return toolErr, nil
+		}
+		dstName, toolErr := mcpRequiredStringArg(args, "destination_pod")
+		if toolErr != nil {
+			return toolErr, nil
+		}
+
+		var port *networkpolicy.PortSpec
+		if raw, ok := args["port"]; ok {
+			f, ok := raw.(float64)
+			if !ok || f <= 0 || f > 65535 || f != float64(int64(f)) {
+				return mcpToolError(ErrCodeInvalidArgument, "port must be a positive integer between 1 and 65535", map[string]any{"argument": "port"}), nil
+			}
+			proto := corev1.ProtocolTCP
+			if rawProto, toolErr := mcpStringArg(args, "protocol"); toolErr != nil {
+				return toolErr, nil
+			} else if rawProto != "" {
+				normalized := corev1.Protocol(strings.ToUpper(rawProto))
+				switch normalized {
+				case corev1.ProtocolTCP, corev1.ProtocolUDP, corev1.ProtocolSCTP:
+					proto = normalized
+				default:
+					return mcpToolError(ErrCodeInvalidArgument, fmt.Sprintf("protocol must be one of TCP, UDP, SCTP (got %q)", rawProto), map[string]any{"argument": "protocol", "supported_values": []string{"TCP", "UDP", "SCTP"}}), nil
+				}
+			}
+			port = &networkpolicy.PortSpec{Protocol: proto, Port: int32(f)}
+		}
+
+		params := url.Values{
+			"source_namespace":      {srcNS},
+			"source_pod":            {srcName},
+			"destination_namespace": {dstNS},
+			"destination_pod":       {dstName},
+		}
+		if port != nil {
+			params.Set("port", strconv.Itoa(int(port.Port)))
+			params.Set("protocol", string(port.Protocol))
+		}
+		return ksServer.doAnalysis(ctx, "analyze_network_reachability", params, func(ctx context.Context) *mcp.CallToolResult {
+			k8sClient, err := ksServer.getK8sClient()
+			if err != nil {
+				return mcpToolError(ErrCodeK8sClientError, fmt.Sprintf("failed to get k8s client: %v", err), nil)
+			}
+			dynClient := k8sClient.DynamicClient
+
+			policyList, err := dynClient.Resource(networkPolicyGVR).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return mcpToolError(classifyScanError(err), fmt.Sprintf("failed to list NetworkPolicy objects: %v", err), map[string]any{"resource_type": "NetworkPolicy"})
+			}
+			namespaceList, err := dynClient.Resource(namespaceGVR).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return mcpToolError(classifyScanError(err), fmt.Sprintf("failed to list Namespace objects: %v", err), map[string]any{"resource_type": "Namespace"})
+			}
+			srcPodObj, err := dynClient.Resource(podGVR).Namespace(srcNS).Get(ctx, srcName, metav1.GetOptions{})
+			if err != nil {
+				return mcpToolError(classifyScanError(err), fmt.Sprintf("failed to get source pod %s/%s: %v", srcNS, srcName, err), map[string]any{"resource_type": "Pod", "namespace": srcNS, "name": srcName})
+			}
+			dstPodObj, err := dynClient.Resource(podGVR).Namespace(dstNS).Get(ctx, dstName, metav1.GetOptions{})
+			if err != nil {
+				return mcpToolError(classifyScanError(err), fmt.Sprintf("failed to get destination pod %s/%s: %v", dstNS, dstName, err), map[string]any{"resource_type": "Pod", "namespace": dstNS, "name": dstName})
+			}
+
+			resources := make(map[string]workloadinterface.IMetadata, len(policyList.Items)+len(namespaceList.Items))
+			for i := range policyList.Items {
+				w := workloadinterface.NewWorkloadObj(policyList.Items[i].Object)
+				resources[w.GetID()] = w
+			}
+			for i := range namespaceList.Items {
+				w := workloadinterface.NewWorkloadObj(namespaceList.Items[i].Object)
+				resources[w.GetID()] = w
+			}
+
+			policies, namespaces, decodeErrs := networkpolicy.FromResources(resources)
+
+			idx, indexErrs := networkpolicy.NewIndex(policies, namespaces)
+			decodeErrs = append(decodeErrs, indexErrs...)
+
+			src := networkpolicy.EndpointFromResource(workloadinterface.NewWorkloadObj(srcPodObj.Object))
+			dst := networkpolicy.EndpointFromResource(workloadinterface.NewWorkloadObj(dstPodObj.Object))
+			if ip, found := unstructuredNestedString(srcPodObj.Object, "status", "podIP"); found {
+				src.IP = ip
+			}
+			src.IPs = unstructuredPodIPs(srcPodObj.Object)
+			if ip, found := unstructuredNestedString(dstPodObj.Object, "status", "podIP"); found {
+				dst.IP = ip
+			}
+			dst.IPs = unstructuredPodIPs(dstPodObj.Object)
+
+			verdict, egress, ingress := idx.Reaches(src, dst, port)
+
+			result := map[string]any{
+				"verdict": verdict.String(),
+				"egress": map[string]any{
+					"verdict":        egress.Verdict.String(),
+					"reason":         egress.Reason,
+					"matched_policy": egress.MatchedPolicy,
+				},
+				"ingress": map[string]any{
+					"verdict":        ingress.Verdict.String(),
+					"reason":         ingress.Reason,
+					"matched_policy": ingress.MatchedPolicy,
+				},
+			}
+			if len(decodeErrs) > 0 {
+				msgs := make([]string, len(decodeErrs))
+				for i, e := range decodeErrs {
+					msgs[i] = e.Error()
+				}
+				result["decode_warnings"] = msgs
+				// A dropped NetworkPolicy (decode failure, or an unparseable
+				// podSelector) could have been the one restricting or allowing
+				// this exact connection, in either direction -- so a confident
+				// allowed/denied computed without it is not trustworthy. This
+				// package's own three-valued design exists precisely to avoid
+				// reporting a confident-but-wrong answer; a dropped policy is
+				// such a case, so the top-level verdict is downgraded here even
+				// though the underlying egress/ingress computation itself
+				// still reports whatever it could determine.
+				result["verdict"] = networkpolicy.Unknown.String()
+			}
+
+			resBytes, err := json.Marshal(result)
+			if err != nil {
+				return mcpToolError(ErrCodeMarshalError, fmt.Sprintf("failed to marshal result: %v", err), nil)
+			}
+			return mcp.NewToolResultText(string(resBytes))
+		}), nil
+	})
+}
+
+// unstructuredNestedString reads a nested string field from an unstructured
+// object without pulling in the full unstructured helper package's error
+// semantics for a lookup this shallow. found is false if any segment of the
+// path is absent or not a string; that is not an error, just "unknown IP,"
+// which the caller already treats as an absent IP.
+func unstructuredNestedString(obj map[string]any, path ...string) (value string, found bool) {
+	cur := any(obj)
+	for _, segment := range path {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return "", false
+		}
+		cur, ok = m[segment]
+		if !ok {
+			return "", false
+		}
+	}
+	s, ok := cur.(string)
+	if !ok {
+		return "", false
+	}
+	return s, true
+}
+
+// unstructuredPodIPs reads a Pod's status.podIPs, which on a dual-stack
+// cluster holds one address per IP family where status.podIP holds only the
+// primary one. An absent or malformed list, or entry, is skipped the same
+// way unstructuredNestedString treats an absent podIP.
+func unstructuredPodIPs(obj map[string]any) []string {
+	status, ok := obj["status"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	entries, ok := status["podIPs"].([]any)
+	if !ok {
+		return nil
+	}
+	var ips []string
+	for _, entry := range entries {
+		if ip, found := unstructuredNestedString(map[string]any{"entry": entry}, "entry", "ip"); found && ip != "" {
+			ips = append(ips, ip)
+		}
+	}
+	return ips
+}

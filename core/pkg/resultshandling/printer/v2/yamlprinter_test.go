@@ -1,0 +1,401 @@
+package printer
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"sigs.k8s.io/yaml"
+)
+
+func TestSetWriter_Yaml(t *testing.T) {
+	tests := []struct {
+		name       string
+		outputFile string
+		wantFile   string
+	}{
+		{"bare name", "scan-result", "scan-result.yaml"},
+		{"whitespace padded", "  scan-result  ", "scan-result.yaml"},
+		{"whitespace only", "   ", "report.yaml"},
+		{"preserve .yaml", "scan-result.yaml", "scan-result.yaml"},
+		{"preserve .yml", "scan-result.yml", "scan-result.yml"},
+		{"preserve .YML", "scan-result.YML", "scan-result.YML"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workingDir := t.TempDir()
+			originalDir, err := os.Getwd()
+			require.NoError(t, err)
+			require.NoError(t, os.Chdir(workingDir))
+			t.Cleanup(func() { require.NoError(t, os.Chdir(originalDir)) })
+
+			p := NewYamlPrinter()
+			require.NoError(t, p.SetWriter(context.Background(), tt.outputFile))
+			defer p.CloseWriter()
+			assert.Equal(t, tt.wantFile, filepath.Base(p.writer.Name()))
+			assert.FileExists(t, filepath.Join(workingDir, tt.wantFile))
+		})
+	}
+}
+
+func TestScore_Yaml(t *testing.T) {
+	tests := []struct {
+		name  string
+		score float32
+		want  string
+	}{
+		{
+			name:  "Score not an integer",
+			score: 20.7,
+			want:  "\nOverall compliance-score (100- Excellent, 0- All failed): 21\n",
+		},
+		{
+			name:  "Fractional score below perfect",
+			score: 99.5,
+			want:  "\nOverall compliance-score (100- Excellent, 0- All failed): 99\n",
+		},
+		{
+			name:  "Score less than 0",
+			score: -20.0,
+			want:  "\nOverall compliance-score (100- Excellent, 0- All failed): 0\n",
+		},
+		{
+			name:  "Score greater than 100",
+			score: 120.0,
+			want:  "\nOverall compliance-score (100- Excellent, 0- All failed): 100\n",
+		},
+		{
+			name:  "Score 50",
+			score: 50.0,
+			want:  "\nOverall compliance-score (100- Excellent, 0- All failed): 50\n",
+		},
+		{
+			name:  "Zero Score",
+			score: 0.0,
+			want:  "\nOverall compliance-score (100- Excellent, 0- All failed): 0\n",
+		},
+		{
+			name:  "Perfect Score",
+			score: 100,
+			want:  "\nOverall compliance-score (100- Excellent, 0- All failed): 100\n",
+		},
+	}
+
+	yp := NewYamlPrinter()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f, err := os.CreateTemp("", "pdfPrinter-score-output")
+			if err != nil {
+				panic(err)
+			}
+			defer func() {
+				_ = f.Close()
+			}()
+
+			oldStderr := os.Stderr
+			defer func() {
+				os.Stderr = oldStderr
+			}()
+			os.Stderr = f
+
+			yp.Score(tt.score)
+
+			f.Seek(0, 0)
+			got, err := io.ReadAll(f)
+			if err != nil {
+				panic(err)
+			}
+			assert.Equal(t, tt.want, string(got))
+		})
+	}
+}
+
+func TestActionPrint_Yaml(t *testing.T) {
+	session := cautils.NewOPASessionObjMock()
+
+	tmpYaml, err := os.CreateTemp("", "yaml-regression-*.yaml")
+	assert.NoError(t, err)
+	defer func() {
+		_ = os.Remove(tmpYaml.Name())
+	}()
+
+	yp := NewYamlPrinter()
+	yp.writer = tmpYaml
+	yp.ActionPrint(context.Background(), session, nil)
+	assert.NoError(t, tmpYaml.Close())
+
+	rawYaml, err := os.ReadFile(tmpYaml.Name())
+	assert.NoError(t, err)
+
+	var gotYaml interface{}
+	err = yaml.Unmarshal(rawYaml, &gotYaml)
+	assert.NoError(t, err, "output must be valid YAML")
+
+	tmpJson, err := os.CreateTemp("", "json-regression-*.json")
+	assert.NoError(t, err)
+	defer func() {
+		_ = os.Remove(tmpJson.Name())
+	}()
+
+	jp := NewJsonPrinter()
+	jp.writer = tmpJson
+	jp.ActionPrint(context.Background(), session, nil)
+	assert.NoError(t, tmpJson.Close())
+
+	rawJson, err := os.ReadFile(tmpJson.Name())
+	assert.NoError(t, err)
+
+	var gotJson interface{}
+	err = json.Unmarshal(rawJson, &gotJson)
+	assert.NoError(t, err, "output must be valid JSON")
+
+	assert.Equal(t, gotJson, gotYaml)
+}
+
+// TestActionPrint_YamlIncludesSessionSections covers the sections the JSON
+// report writes from the session rather than from the posture report. The
+// YAML report has to carry them as well.
+func TestActionPrint_YamlIncludesSessionSections(t *testing.T) {
+	tests := []struct {
+		name      string
+		key       string
+		configure func(*cautils.OPASessionObj)
+	}{
+		{
+			name: "exception audit",
+			key:  "exceptionAudit",
+			configure: func(s *cautils.OPASessionObj) {
+				s.ExceptionAudit = &cautils.ExceptionAudit{
+					Generated: true,
+					Summary: cautils.ExceptionAuditSummary{
+						Total:   1,
+						Active:  1,
+						Matched: 1,
+					},
+					Items: []cautils.ExceptionAuditItem{
+						{
+							Name:       "matched-exception",
+							Status:     "matched",
+							MatchCount: 1,
+							ControlIDs: []string{"C-0001"},
+						},
+					},
+				}
+			},
+		},
+		{
+			name: "namespace summaries",
+			key:  "namespaceSummaries",
+			configure: func(s *cautils.OPASessionObj) {
+				s.NamespaceSummaries = cautils.NamespaceSummaries{{Namespace: "default", ComplianceScore: 50, NonCompliantControls: 1, TotalControls: 2, ResourceCount: 1}}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			session := cautils.NewOPASessionObjMock()
+			tt.configure(session)
+
+			// YAML first: FinalizeResults stamps the generation time on the
+			// session, and the JSON printer then reuses it.
+			gotYaml := yamlPrinterOutput(t, session)
+			gotJson := jsonPrinterOutput(t, session)
+
+			require.Contains(t, gotJson, tt.key)
+			assert.Contains(t, gotYaml, tt.key)
+			assert.Equal(t, gotJson, gotYaml)
+		})
+	}
+}
+
+func yamlPrinterOutput(t *testing.T, session *cautils.OPASessionObj) map[string]any {
+	t.Helper()
+
+	tmpYaml, err := os.CreateTemp("", "yaml-session-sections-*.yaml")
+	require.NoError(t, err)
+	defer func() {
+		_ = os.Remove(tmpYaml.Name())
+	}()
+
+	yp := NewYamlPrinter()
+	yp.writer = tmpYaml
+	require.NoError(t, yp.ActionPrint(context.Background(), session, nil))
+	require.NoError(t, tmpYaml.Close())
+
+	rawYaml, err := os.ReadFile(tmpYaml.Name())
+	require.NoError(t, err)
+
+	var got map[string]any
+	require.NoError(t, yaml.Unmarshal(rawYaml, &got))
+	return got
+}
+
+func TestActionPrint_ImageScan_Yaml(t *testing.T) {
+	// A populated []cautils.ImageScanData
+	imageScanData := []cautils.ImageScanData{buildSeverityExceptionImageScanData()}
+
+	tmpYaml, err := os.CreateTemp("", "yaml-imagescan-*.yaml")
+	assert.NoError(t, err)
+	defer func() {
+		_ = os.Remove(tmpYaml.Name())
+	}()
+
+	yp := NewYamlPrinter()
+	yp.writer = tmpYaml
+	yp.ActionPrint(context.Background(), nil, imageScanData)
+	assert.NoError(t, tmpYaml.Close())
+
+	rawYaml, err := os.ReadFile(tmpYaml.Name())
+	assert.NoError(t, err)
+
+	var gotYaml interface{}
+	err = yaml.Unmarshal(rawYaml, &gotYaml)
+	assert.NoError(t, err, "output must be valid YAML")
+
+	tmpJson, err := os.CreateTemp("", "json-imagescan-*.json")
+	assert.NoError(t, err)
+	defer func() {
+		_ = os.Remove(tmpJson.Name())
+	}()
+
+	jp := NewJsonPrinter()
+	jp.writer = tmpJson
+	jp.ActionPrint(context.Background(), nil, imageScanData)
+	assert.NoError(t, tmpJson.Close())
+
+	rawJson, err := os.ReadFile(tmpJson.Name())
+	assert.NoError(t, err)
+
+	var gotJson interface{}
+	err = json.Unmarshal(rawJson, &gotJson)
+	assert.NoError(t, err, "output must be valid JSON")
+
+	assert.Equal(t, gotJson, gotYaml)
+}
+
+func TestActionPrint_MultiImageScan_Yaml(t *testing.T) {
+	// A populated []cautils.ImageScanData with multiple distinct images.
+	// Image itself is never serialized (presentImageScan in jsonprinter.go
+	// only consumes Packages, Context, Matches, IgnoredMatches,
+	// VulnerabilityProvider and SBOM), so the fixtures must also differ in
+	// one of those fields - otherwise an implementation that emits the first
+	// document twice would still pass.
+	first := buildSeverityExceptionImageScanData()
+	first.Image = "test-image:one"
+
+	second := buildSeverityExceptionImageScanData()
+	second.Image = "test-image:two"
+	second.Packages[0].Version = "2.0.0" // pkg-CVE-KEPT: distinct, serialized version
+
+	imageScanData := []cautils.ImageScanData{first, second}
+
+	tmpYaml, err := os.CreateTemp("", "yaml-multiimagescan-*.yaml")
+	assert.NoError(t, err)
+	defer func() {
+		_ = os.Remove(tmpYaml.Name())
+	}()
+
+	yp := NewYamlPrinter()
+	yp.writer = tmpYaml
+	err = yp.ActionPrint(context.Background(), nil, imageScanData)
+	assert.NoError(t, err)
+	assert.NoError(t, tmpYaml.Close())
+
+	rawYaml, err := os.ReadFile(tmpYaml.Name())
+	assert.NoError(t, err)
+
+	var gotYaml []interface{}
+	err = yaml.Unmarshal(rawYaml, &gotYaml)
+	assert.NoError(t, err, "output must be valid YAML array")
+	require.Len(t, gotYaml, 2, "multi-image YAML output must contain all scanned images")
+
+	assert.Equal(t, "1.0.0", findArtifactVersion(t, gotYaml[0], "pkg-CVE-KEPT"),
+		"first YAML element must reflect the first image's package version")
+	assert.Equal(t, "2.0.0", findArtifactVersion(t, gotYaml[1], "pkg-CVE-KEPT"),
+		"second YAML element must reflect the second image's package version")
+
+	tmpJson, err := os.CreateTemp("", "json-multiimagescan-*.json")
+	assert.NoError(t, err)
+	defer func() {
+		_ = os.Remove(tmpJson.Name())
+	}()
+
+	jp := NewJsonPrinter()
+	jp.writer = tmpJson
+	err = jp.ActionPrint(context.Background(), nil, imageScanData)
+	assert.NoError(t, err)
+	assert.NoError(t, tmpJson.Close())
+
+	rawJson, err := os.ReadFile(tmpJson.Name())
+	assert.NoError(t, err)
+
+	var gotJson interface{}
+	err = json.Unmarshal(rawJson, &gotJson)
+	assert.NoError(t, err, "output must be valid JSON")
+
+	assert.Equal(t, gotJson, gotYaml)
+}
+
+// findArtifactVersion returns the "version" of the matches[].artifact entry
+// named packageName within a decoded image-scan document (YAML or JSON,
+// both unmarshal into plain map[string]interface{} / []interface{}).
+func findArtifactVersion(t *testing.T, doc interface{}, packageName string) string {
+	t.Helper()
+	m, ok := doc.(map[string]interface{})
+	require.True(t, ok, "expected a document mapping")
+	matches, ok := m["matches"].([]interface{})
+	require.True(t, ok, "expected a matches array")
+	for _, raw := range matches {
+		match, ok := raw.(map[string]interface{})
+		require.True(t, ok, "expected a match mapping")
+		artifact, ok := match["artifact"].(map[string]interface{})
+		require.True(t, ok, "expected an artifact mapping")
+		if artifact["name"] == packageName {
+			version, _ := artifact["version"].(string)
+			return version
+		}
+	}
+	t.Fatalf("package %q not found in matches", packageName)
+	return ""
+}
+
+func TestPrintConfigurationsScanningYaml_NilReportReturnsError(t *testing.T) {
+	yp := NewYamlPrinter()
+	err := printConfigurationsScanningYaml(nil, nil, yp)
+	assert.Error(t, err)
+	assert.EqualError(t, err, "no data provided for YAML output")
+
+	err = printConfigurationsScanningYaml(&cautils.OPASessionObj{Report: nil}, nil, yp)
+	assert.Error(t, err)
+	assert.EqualError(t, err, "no data provided for YAML output")
+}
+
+func TestYamlPrinter_ImageScan_NilReportFallback(t *testing.T) {
+	tmp, err := os.CreateTemp("", "yaml-nil-report-*.yaml")
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, tmp.Close())
+		assert.NoError(t, os.Remove(tmp.Name()))
+	}()
+
+	yp := NewYamlPrinter()
+	yp.writer = tmp
+	session := &cautils.OPASessionObj{Report: nil}
+	imageScanData := []cautils.ImageScanData{buildSeverityExceptionImageScanData()}
+
+	require.NoError(t, yp.ActionPrint(context.Background(), session, imageScanData))
+
+	raw, err := os.ReadFile(tmp.Name())
+	require.NoError(t, err)
+	var doc map[string]interface{}
+	require.NoError(t, yaml.Unmarshal(raw, &doc))
+	assert.Contains(t, doc, "matches")
+}

@@ -1,0 +1,332 @@
+package getter
+
+import (
+	"context"
+	stdjson "encoding/json"
+	"fmt"
+	"maps"
+	"regexp"
+	"slices"
+	"strings"
+
+	"github.com/armosec/armoapi-go/armotypes"
+	"github.com/armosec/armoapi-go/identifiers"
+	"github.com/kubescape/go-logger"
+	"github.com/kubescape/go-logger/helpers"
+	"github.com/kubescape/opa-utils/exceptions"
+)
+
+var _ IExceptionsGetter = &MergedExceptionsGetter{}
+
+// MergedExceptionsGetter combines exceptions from a primary source and a secondary source.
+// Primary source failures are returned as errors; secondary source failures are logged and ignored.
+type MergedExceptionsGetter struct {
+	primary   IExceptionsGetter
+	secondary IExceptionsGetter
+}
+
+// NewMergedExceptionsGetter combines primary policies with optional CRD policies,
+// preserving primary precedence wherever their matching scopes overlap.
+func NewMergedExceptionsGetter(primary, secondary IExceptionsGetter) *MergedExceptionsGetter {
+	return &MergedExceptionsGetter{primary: primary, secondary: secondary}
+}
+
+// GetExceptions loads policies and resets primary provenance before merging CRDs.
+// It preserves caller-owned policies and tolerates non-context secondary errors.
+func (g *MergedExceptionsGetter) GetExceptions(ctx context.Context, clusterName string) ([]armotypes.PostureExceptionPolicy, error) {
+	if g == nil || g.primary == nil {
+		return []armotypes.PostureExceptionPolicy{}, nil
+	}
+
+	exceptions, err := g.primary.GetExceptions(ctx, clusterName)
+	if err != nil {
+		return nil, err
+	}
+
+	// Reloaded policies belong to the primary source, even if a saved report
+	// marked them as secondary. Normalize before every secondary-source path,
+	// copying the slice and changed maps so reusable getter results stay intact.
+	exceptions = slices.Clone(exceptions)
+	for i := range exceptions {
+		if _, marked := exceptions[i].Attributes[secondaryExceptionSourceAttribute]; marked {
+			exceptions[i].Attributes = maps.Clone(exceptions[i].Attributes)
+			delete(exceptions[i].Attributes, secondaryExceptionSourceAttribute)
+		}
+	}
+
+	if g.secondary == nil {
+		return exceptions, nil
+	}
+
+	crdExceptions, err := g.secondary.GetExceptions(ctx, clusterName)
+	if err != nil {
+		if isContextErr(err) {
+			return nil, err
+		}
+		// Secondary (CRD) failures must not break the scan, but a swallowed error hides
+		// version skew or RBAC gaps; surface it at Warning so it is observable.
+		logger.L().Ctx(ctx).Warning("failed to get CRD security exceptions; continuing with primary exceptions only",
+			helpers.Error(err))
+		return exceptions, nil
+	}
+
+	if len(crdExceptions) == 0 {
+		return exceptions, nil
+	}
+
+	return deduplicateExceptions(exceptions, crdExceptions), nil
+}
+
+// IncludesClusterExceptions reports whether a secondary source is merged into
+// the primary one, which is how the cluster's SecurityException CRDs reach a
+// scan. Exceptions read with and without them are not interchangeable, so a
+// cache must not serve one kind of scan with what it stored for the other.
+func (g *MergedExceptionsGetter) IncludesClusterExceptions() bool {
+	return g != nil && g.secondary != nil
+}
+
+// CacheSource identifies the primary source and whether the cluster's
+// SecurityException CRDs are merged into it. The primary is quoted so no
+// primary identity can read as another merged identity. A nil getter is
+// identified the same way as no getter at all.
+func (g *MergedExceptionsGetter) CacheSource() string {
+	if g == nil {
+		return CacheSourceOf(nil)
+	}
+	return g.cacheSource(CacheSourceOf(g.primary))
+}
+
+// LoadedCacheSource identifies what the primary source's last load read,
+// combined the way CacheSource combines it.
+func (g *MergedExceptionsGetter) LoadedCacheSource() (string, bool) {
+	if g == nil {
+		return CacheSourceOf(nil), true
+	}
+	primary, ok := LoadedCacheSourceOf(g.primary)
+	return g.cacheSource(primary), ok
+}
+
+func (g *MergedExceptionsGetter) cacheSource(primary string) string {
+	return fmt.Sprintf("merged(%q,clusterExceptions=%t)", primary, g.IncludesClusterExceptions())
+}
+
+// SourceFile forwards the file of the primary source, if it reads one.
+func (g *MergedExceptionsGetter) SourceFile() (string, bool) {
+	if g == nil {
+		return "", false
+	}
+	file, ok := g.primary.(SourceFiler)
+	if !ok {
+		return "", false
+	}
+	return file.SourceFile()
+}
+
+// ConsumedFileDigest forwards provenance from the primary local source. CRD
+// exceptions are not files and therefore deliberately have no file digest.
+func (g *MergedExceptionsGetter) ConsumedFileDigest() (path, digest string, ok bool) {
+	if g == nil {
+		return "", "", false
+	}
+	digester, ok := g.primary.(ConsumedFileDigester)
+	if !ok {
+		return "", "", false
+	}
+	return digester.ConsumedFileDigest()
+}
+
+// deduplicateExceptions enforces the design review's precedence rule: cloud/file
+// (primary) exceptions are added first, and a CRD exception is appended only for the
+// control+workload designators not already covered by a primary exception. Partial
+// overlaps keep the non-overlapping designators of the CRD exception. Remaining
+// overlaps (including regex API groups) are resolved by FilterMatchedExceptions
+// after workload matching; a broader CRD must retain its non-overlapping scope.
+func deduplicateExceptions(
+	cloudExceptions []armotypes.PostureExceptionPolicy,
+	crdExceptions []armotypes.PostureExceptionPolicy,
+) []armotypes.PostureExceptionPolicy {
+	if len(cloudExceptions) == 0 && len(crdExceptions) == 0 {
+		return []armotypes.PostureExceptionPolicy{}
+	}
+
+	merged := make([]armotypes.PostureExceptionPolicy, 0, len(cloudExceptions)+len(crdExceptions))
+	merged = append(merged, cloudExceptions...)
+	if len(crdExceptions) == 0 {
+		return merged
+	}
+
+	covered, global := coveredPostureScopes(cloudExceptions)
+	matcher := newScopeMatcher()
+
+	for _, crd := range crdExceptions {
+		// Preserve the source boundary for precedence after workload matching.
+		// Copy the map: callers may reuse their original policies on another scan.
+		crd.Attributes = maps.Clone(crd.Attributes)
+		if crd.Attributes == nil {
+			crd.Attributes = make(map[string]any)
+		}
+		crd.Attributes[secondaryExceptionSourceAttribute] = true
+		// Exceptions without resolvable control+workload keys can't be deduped; keep them.
+		if len(crd.Resources) == 0 || len(crd.PosturePolicies) == 0 {
+			merged = append(merged, crd)
+			continue
+		}
+
+		for _, policy := range crd.PosturePolicies {
+			if matcher.coveredBy(global, policy) {
+				// A cloud exception with no Resources at all applies with no scope
+				// constraint - the same convention hasExplicitControlException uses
+				// for manual controls - so it already covers this policy everywhere
+				// and fully subsumes the CRD policy, not just designators it happens
+				// to share a resource key with.
+				continue
+			}
+			filteredResources := make([]identifiers.PortalDesignator, 0, len(crd.Resources))
+			for _, resource := range crd.Resources {
+				if matcher.coveredBy(covered[designatorDedupKey(resource)], policy) {
+					continue
+				}
+				// A primary that omits apiGroup covers both core and named groups.
+				// The reverse would discard resources outside the primary's group.
+				if _, hasAPIGroup := resource.Attributes[identifiers.AttributeApiGroup]; hasAPIGroup {
+					unscoped := resource
+					unscoped.Attributes = maps.Clone(resource.Attributes)
+					delete(unscoped.Attributes, identifiers.AttributeApiGroup)
+					if matcher.coveredBy(covered[designatorDedupKey(unscoped)], policy) {
+						continue
+					}
+				}
+				filteredResources = append(filteredResources, resource)
+			}
+			if len(filteredResources) == 0 {
+				continue
+			}
+			filteredPolicy := crd
+			filteredPolicy.Resources = filteredResources
+			filteredPolicy.PosturePolicies = []armotypes.PosturePolicy{policy}
+			merged = append(merged, filteredPolicy)
+		}
+	}
+
+	return merged
+}
+
+// coveredPostureScopes indexes the primary posture-policy scopes by workload
+// designator, and separately collects policies from a primary exception that has
+// no Resources at all into global. Such an exception applies with no scope
+// constraint - the same convention hasExplicitControlException already uses for
+// manual controls - so it covers every designator for a matching control/framework/
+// rule scope, not just one indexed by a specific resource key. A policy without a
+// control ID carries nothing to measure a CRD policy against, so it never
+// suppresses one.
+func coveredPostureScopes(exceptions []armotypes.PostureExceptionPolicy) (covered map[string][]armotypes.PosturePolicy, global []armotypes.PosturePolicy) {
+	covered = make(map[string][]armotypes.PosturePolicy, len(exceptions))
+	for _, exception := range exceptions {
+		// These constraints must be evaluated at scan time. Removing a CRD here
+		// could discard its scope outside the selector or after primary expiry.
+		if exception.ObjectSelector != nil || exception.ExpirationDate != nil {
+			continue
+		}
+		for _, policy := range exception.PosturePolicies {
+			if policy.ControlID == "" {
+				continue
+			}
+			if len(exception.Resources) == 0 {
+				if !slices.Contains(global, policy) {
+					global = append(global, policy)
+				}
+				continue
+			}
+			for _, resource := range exception.Resources {
+				key := designatorDedupKey(resource)
+				if !slices.Contains(covered[key], policy) {
+					covered[key] = append(covered[key], policy)
+				}
+			}
+		}
+	}
+	return covered, global
+}
+
+// scopeMatcher compares posture-policy scopes the way the exception processor does
+// at evaluation time: a case-insensitive literal or a case-insensitive pattern that
+// has to match the whole value. It uses the processor's own comparison, which also
+// caches compiled patterns across the whole merge.
+type scopeMatcher struct {
+	processor *exceptions.Processor
+}
+
+func newScopeMatcher() *scopeMatcher {
+	return &scopeMatcher{processor: exceptions.NewProcessor()}
+}
+
+// coveredBy reports whether any primary scope already applies everywhere policy does.
+// A primary exception that does not reach the CRD policy's framework or rule cannot
+// take precedence over it.
+func (m *scopeMatcher) coveredBy(primaries []armotypes.PosturePolicy, policy armotypes.PosturePolicy) bool {
+	for _, primary := range primaries {
+		if m.covers(primary.FrameworkName, policy.FrameworkName) &&
+			m.covers(primary.ControlID, policy.ControlID) &&
+			m.covers(primary.RuleName, policy.RuleName) {
+			return true
+		}
+	}
+	return false
+}
+
+// covers reports whether a primary scope field applies wherever the CRD one does. An
+// empty primary field is unscoped and covers any value; a named one cannot cover an
+// empty CRD field, which is broader.
+func (m *scopeMatcher) covers(primary, crd string) bool {
+	if primary == "" {
+		return true
+	}
+	if crd == "" {
+		return false
+	}
+	if primary == crd || primary == "*" {
+		return true
+	}
+
+	// If the secondary scope is literal (no regex metacharacters at all),
+	// compare against it directly. Case-folding applies to literal names.
+	if regexp.QuoteMeta(crd) == crd {
+		if strings.EqualFold(primary, crd) {
+			return true
+		}
+		return m.processor.RegexCompareControlID(primary, crd)
+	}
+
+	// When the secondary scope contains dots, it is ambiguous: it may be a literal
+	// framework name containing dots (e.g. cis-v1.10.0) or a regex where unescaped
+	// dots match any character (e.g. cis.v1.10.0 matching cis+v1+10+0).
+	// A scope whose only metacharacters are dots has no other regex escapes (like \d or [a-z]).
+	if withoutDots := strings.ReplaceAll(crd, ".", ""); regexp.QuoteMeta(withoutDots) == withoutDots {
+		// An identical scope in another case (e.g. CIS-v1.10.0 vs cis-v1.10.0) covers itself.
+		if strings.EqualFold(primary, crd) {
+			return true
+		}
+		if strings.HasSuffix(primary, ".*") {
+			prefix := strings.TrimSuffix(primary, ".*")
+			if regexp.QuoteMeta(prefix) == prefix &&
+				strings.HasPrefix(strings.ToLower(crd), strings.ToLower(prefix)) {
+				// Verify that all dots in crd occur within the wildcard portion (after prefix).
+				if firstDot := strings.Index(crd, "."); firstDot >= len(prefix) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// designatorDedupKey identifies the entire resource constraint. JSON preserves
+// API-group presence and all other attributes (including labels and cluster),
+// so static deduplication cannot discard a CRD's broader workload scope.
+func designatorDedupKey(designator identifiers.PortalDesignator) string {
+	// PortalDesignator contains only strings and a string map, so marshaling
+	// cannot fail and map keys are ordered deterministically.
+	key, _ := stdjson.Marshal(designator)
+	return string(key)
+}

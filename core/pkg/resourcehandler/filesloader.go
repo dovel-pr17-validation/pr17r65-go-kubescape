@@ -1,0 +1,857 @@
+package resourcehandler
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
+
+	giturl "github.com/kubescape/go-git-url"
+	"github.com/kubescape/go-logger"
+	"github.com/kubescape/go-logger/helpers"
+	"github.com/kubescape/k8s-interface/workloadinterface"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/pkg/pathcontainment"
+	"github.com/kubescape/opa-utils/objectsenvelopes/localworkload"
+	"github.com/kubescape/opa-utils/reporthandling"
+	"k8s.io/apimachinery/pkg/version"
+)
+
+// FileResourceHandler handle resources from files and URLs
+type FileResourceHandler struct{}
+
+func NewFileResourceHandler() *FileResourceHandler {
+	return &FileResourceHandler{}
+}
+
+func (fileHandler *FileResourceHandler) GetResources(ctx context.Context, sessionObj *cautils.OPASessionObj, scanInfo *cautils.ScanInfo) (cautils.K8SResources, map[string]workloadinterface.IMetadata, cautils.ExternalResources, map[string]bool, error) {
+	allResources := map[string]workloadinterface.IMetadata{}
+	externalResources := cautils.ExternalResources{}
+
+	if len(scanInfo.InputPatterns) == 0 {
+		return nil, nil, nil, nil, fmt.Errorf("missing input")
+	}
+
+	logger.L().Start("Accessing local objects...")
+
+	// load resources from all input paths
+	mappedResources := map[string][]workloadinterface.IMetadata{}
+	var inputs []loadedInput
+	for path := range scanInfo.InputPatterns {
+		var input loadedInput
+		var skipped []cautils.SkippedManifest
+		var err error
+
+		cloneDepth := scanInfo.EffectiveGitCloneDepth()
+		helmValueOpts := helmValueOptionsFromScanInfo(scanInfo)
+		if scanInfo.ChartPath != "" && scanInfo.FilePath != "" {
+			// A chart-and-file input names one workload, leaving nothing to narrow.
+			input.sources, input.workloads, err = getWorkloadFromHelmChart(ctx, scanInfo.InputPatterns[path], scanInfo.ChartPath, scanInfo.FilePath, helmValueOpts, cloneDepth)
+		} else {
+			pathFilter, filterErr := pathFilterFromScanInfo(ctx, scanInfo.InputPatterns[path], scanInfo)
+			if filterErr != nil {
+				return nil, allResources, nil, nil, filterErr
+			}
+			input.root, input.sources, input.workloads, skipped, err = getResourcesFromInput(ctx, scanInfo.InputPatterns[path], helmValueOpts, pathFilter, cloneDepth, scanInfo.WorkspaceDir)
+			input.remote = remoteName(scanInfo.InputPatterns[path], cloneDepth)
+		}
+		sessionObj.SkippedManifests = append(sessionObj.SkippedManifests, skipped...)
+		if err != nil {
+			return nil, allResources, nil, nil, err
+		}
+		if len(input.workloads) == 0 {
+			continue
+		}
+		inputs = append(inputs, input)
+	}
+
+	anchorInputs(ctx, inputs)
+	for _, input := range inputs {
+		maps.Copy(sessionObj.ResourceSource, input.sources)
+
+		// map all resources: map["/apiVersion/version/kind"][]<k8s workloads>
+		addWorkloadsToResourcesMap(mappedResources, input.workloads)
+	}
+
+	// locate input k8s object in the mapped resources - if not found or not a valid resource, return error
+	var err error
+	if sessionObj.SingleResourceScan, err = findScanObjectResource(mappedResources, scanInfo.ScanObject); err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	if sessionObj.SingleResourceScan != nil && workloadHasParent(sessionObj.SingleResourceScan.GetObject()) {
+		return nil, nil, nil, nil, fmt.Errorf("resource %s has a parent and cannot be scanned", sessionObj.SingleResourceScan.GetID())
+	}
+
+	scanningScope := cautils.GetScanningScope(sessionObj.Metadata.ContextMetadata)
+
+	// build a resources map, based on the policies
+	// map resources based on framework required resources: map["/group/version/kind"][]<k8s workloads ids>
+	offlineResolver := newOfflineManifestResourceResolver(mappedResources)
+	resourceToQuery, excludedRulesMap := getQueryableResourceMapFromPolicies(sessionObj.Policies, sessionObj.SingleResourceScan, scanningScope, offlineResolver)
+	k8sResources := resourceToQuery.ToK8sResourceMap()
+
+	// save only relevant resources
+	for i := range mappedResources {
+		if _, ok := k8sResources[i]; ok {
+			var ids []string
+			for j := range mappedResources[i] {
+				ids = append(ids, mappedResources[i][j].GetID())
+				allResources[mappedResources[i][j].GetID()] = mappedResources[i][j]
+			}
+			k8sResources[i] = append(k8sResources[i], ids...)
+		}
+	}
+
+	if len(sessionObj.SkippedManifests) > 0 {
+		logger.L().Ctx(ctx).Warning(fmt.Sprintf("%d manifests skipped during scan", len(sessionObj.SkippedManifests)))
+		for _, sk := range sessionObj.SkippedManifests {
+			logger.L().Ctx(ctx).Warning(fmt.Sprintf("  %s: %s", sk.Path, sk.Reason))
+		}
+	}
+
+	logger.L().StopSuccess("Done accessing local objects")
+	// save input resource in resource maps
+	addSingleResourceToResourceMaps(k8sResources, allResources, sessionObj.SingleResourceScan, offlineResolver)
+
+	if err := applyKindFilter(k8sResources, allResources, scanInfo, sessionObj.SingleResourceScan); err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	return k8sResources, allResources, externalResources, excludedRulesMap, nil
+}
+
+// loadedInput is one scan input's resources before they are merged with those
+// of the other inputs.
+type loadedInput struct {
+	root      string // local root its paths are reported against; "" when it has none
+	remote    string // stable name of a cloned remote repository; "" for a local input
+	sources   map[string]reporthandling.Source
+	workloads []workloadinterface.IMetadata
+}
+
+// anchorInputs keeps the resources of a scan with several roots apart.
+//
+// Outside a git repository each input is its own root, and the ID of a plain
+// manifest's resource is derived from its path relative to that root. Scanning
+// dev and prod recorded dev/pod.yaml and prod/pod.yaml both as pod.yaml, so two
+// Pods with the same name got the same ID and one silently replaced the other.
+//
+// Local inputs are therefore reported relative to the deepest directory their
+// roots share: dev/pod.yaml and prod/pod.yaml, the paths and IDs a scan of their
+// parent directory, or of both inside one git repository, already produces. A
+// cloned remote repository is checked out in a random temporary directory, so
+// it is named by its repository instead, which stays the same from run to run.
+// A scan with a single root, local or remote, is left unchanged.
+//
+// Local roots that share no directory, such as two Windows volumes, are left as
+// they are, and resources with the same relative path and identity can still
+// merge.
+func anchorInputs(ctx context.Context, inputs []loadedInput) {
+	anchors := make(map[[2]string]struct{}, len(inputs))
+	for _, input := range inputs {
+		if input.root != "" || input.remote != "" {
+			anchors[[2]string{input.root, input.remote}] = struct{}{}
+		}
+	}
+	if len(anchors) < 2 {
+		return
+	}
+
+	shared := sharedRoot(ctx, inputs)
+	for i := range inputs {
+		input := &inputs[i]
+		switch {
+		case input.remote != "":
+			// The sources stay relative to their own repository.
+			rekeyPlainManifests(input, input.remote, func(source reporthandling.Source) reporthandling.Source { return source })
+		case shared != "" && input.root != "" && input.root != shared:
+			prefix, err := filepath.Rel(shared, input.root)
+			if err != nil {
+				continue
+			}
+			root := input.root
+			rekeyPlainManifests(input, prefix, func(source reporthandling.Source) reporthandling.Source {
+				if source.Path == root && !filepath.IsAbs(source.RelativePath) {
+					source.Path = shared
+					source.RelativePath = filepath.Join(prefix, source.RelativePath)
+				}
+				return source
+			})
+		}
+	}
+}
+
+// rekeyPlainManifests records the plain manifests of input below prefix, which
+// changes their IDs, and passes every source through rebase.
+func rekeyPlainManifests(input *loadedInput, prefix string, rebase func(reporthandling.Source) reporthandling.Source) {
+	// Re-keyed entries go into a new map, so a new ID can never overwrite an old
+	// one that is still to be visited.
+	rebased := make(map[string]reporthandling.Source, len(input.sources))
+	for id, source := range input.sources {
+		if !isPlainManifest(source) {
+			rebased[id] = rebase(source)
+		}
+	}
+	for _, w := range input.workloads {
+		lw, ok := w.(*localworkload.LocalWorkload)
+		if !ok {
+			continue
+		}
+		source, ok := input.sources[lw.GetID()]
+		if !ok || !isPlainManifest(source) {
+			continue
+		}
+		lw.SetPath(filepath.Join(prefix, lw.GetPath()))
+		rebased[lw.GetID()] = rebase(source)
+	}
+	input.sources = rebased
+}
+
+// remoteName names a cloned remote repository by host, owner, repository and
+// branch. It returns "" for a local input.
+func remoteName(input string, depthOpt ...int) string {
+	if cautils.GetClonedPath(input, depthOpt...) == "" {
+		return ""
+	}
+	gitURL, err := giturl.NewGitAPI(input)
+	if err != nil {
+		return ""
+	}
+	name := path.Join(gitURL.GetHostName(), gitURL.GetOwnerName(), gitURL.GetRepoName())
+	if branch := gitURL.GetBranchName(); branch != "" {
+		name += "@" + branch
+	}
+	return name
+}
+
+// isPlainManifest reports whether source is a YAML or JSON file read as is,
+// whose resources carry a root-relative path in their IDs. Rendered Helm,
+// Kustomize and Terraform resources carry their own absolute paths.
+func isPlainManifest(source reporthandling.Source) bool {
+	return source.FileType == reporthandling.SourceTypeYaml || source.FileType == reporthandling.SourceTypeJson
+}
+
+// sharedRoot returns the deepest directory containing every input root, or ""
+// when the inputs have fewer than two distinct roots or share no directory.
+func sharedRoot(ctx context.Context, inputs []loadedInput) string {
+	var first, shared string
+	distinct := false
+	for _, input := range inputs {
+		switch {
+		case input.root == "":
+		case first == "":
+			first, shared = input.root, input.root
+		default:
+			distinct = distinct || input.root != first
+			for !isWithinDir(shared, input.root) {
+				parent := filepath.Dir(shared)
+				if parent == shared {
+					logger.L().Ctx(ctx).Warning("scan inputs share no common directory; resources with the same relative path and identity may be reported once",
+						helpers.String("first", first), helpers.String("other", input.root))
+					return ""
+				}
+				shared = parent
+			}
+		}
+	}
+	if !distinct {
+		return ""
+	}
+	return shared
+}
+
+// isWithinDir reports whether target is dir or lies below it.
+func isWithinDir(dir, target string) bool {
+	rel, err := filepath.Rel(dir, target)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func (fileHandler *FileResourceHandler) GetCloudProvider() string {
+	return ""
+}
+
+// Preflight is not supported for file-based scans: there is no API server to
+// check RBAC access against.
+func (fileHandler *FileResourceHandler) Preflight(ctx context.Context, sessionObj *cautils.OPASessionObj, scanInfo *cautils.ScanInfo) (*PreflightResult, error) {
+	return nil, ErrPreflightNotSupported
+}
+
+// EstimateClusterSize always returns 0 for file-based scans since streaming
+// is not needed for local or URL-based resources.
+func (fileHandler *FileResourceHandler) EstimateClusterSize(ctx context.Context, scanInfo *cautils.ScanInfo) (int, error) {
+	return 0, nil
+}
+
+// StreamResourcesBatches provides a streaming interface for file-based resources.
+// This implementation loads all resources via GetResources and returns them as a
+// single batch — it provides no memory bound and behaves identically to the
+// non-streaming path. File-based scans should not rely on --enable-streaming for
+// memory reduction.
+func (fileHandler *FileResourceHandler) StreamResourcesBatches(ctx context.Context, sessionObj *cautils.OPASessionObj, scanInfo *cautils.ScanInfo) (<-chan *cautils.ResourceBatch, <-chan error, int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, 0, err
+	}
+	batchChan := make(chan *cautils.ResourceBatch, 1)
+	errChan := make(chan error, 1)
+
+	// Collect synchronously so sessionObj mutations (ExcludedRules,
+	// SingleResourceScan, ResourceSource) happen-before the caller's
+	// NewOPAProcessor/ProcessWithStreaming read them, instead of racing from a
+	// producer goroutine like the eager path did. File collection is local and
+	// fast, so this blocks no longer than the old async body did.
+	k8sResources, allResources, externalResources, excludedRulesMap, err := fileHandler.GetResources(ctx, sessionObj, scanInfo)
+	if err := ctx.Err(); err != nil {
+		return nil, nil, 0, err
+	}
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	sessionObj.ExcludedRules = excludedRulesMap
+
+	go func() {
+		defer close(errChan)
+		defer close(batchChan)
+
+		// Create a single batch with all resources
+		batch := cautils.NewResourceBatch(cautils.ClusterScope)
+		batch.K8SResources = k8sResources
+		batch.AllResources = allResources
+		batch.ExternalResources = externalResources
+
+		publishFileResourceBatch(ctx, batchChan, errChan, batch)
+	}()
+
+	return batchChan, errChan, 0, nil
+}
+
+func publishFileResourceBatch(ctx context.Context, batchChan chan<- *cautils.ResourceBatch, errChan chan<- error, batch *cautils.ResourceBatch) {
+	if err := ctx.Err(); err != nil {
+		errChan <- err
+		return
+	}
+
+	select {
+	case batchChan <- batch:
+	case <-ctx.Done():
+		errChan <- ctx.Err()
+	}
+}
+
+// helmValueOptionsFromScanInfo extracts the user-supplied Helm value/release/capability flags from ScanInfo
+// into the cautils.HelmValueOptions used by chart rendering.
+func helmValueOptionsFromScanInfo(scanInfo *cautils.ScanInfo) cautils.HelmValueOptions {
+	if scanInfo == nil {
+		return cautils.HelmValueOptions{}
+	}
+	return cautils.HelmValueOptions{
+		ValueFiles:       scanInfo.HelmValueFiles,
+		Values:           scanInfo.HelmSetValues,
+		StringValues:     scanInfo.HelmSetStringValues,
+		FileValues:       scanInfo.HelmSetFileValues,
+		ReleaseName:      scanInfo.HelmReleaseName,
+		ReleaseNamespace: scanInfo.HelmReleaseNamespace,
+		KubeVersion:      scanInfo.HelmKubeVersion,
+		APIVersions:      scanInfo.HelmAPIVersions,
+	}
+}
+
+// pathFilterFromScanInfo compiles the exclusions that apply to a single scan input, from the
+// ignore file at its root and from --exclude-path. It returns nil when nothing is excluded.
+func pathFilterFromScanInfo(ctx context.Context, input string, scanInfo *cautils.ScanInfo) (*cautils.PathFilter, error) {
+	if scanInfo == nil {
+		return nil, nil
+	}
+
+	filter, err := cautils.NewScanPathFilter(input, scanInfo.ExcludePaths, !scanInfo.NoIgnoreFile, scanInfo.EffectiveGitCloneDepth())
+	if err != nil {
+		return nil, err
+	}
+	if filter != nil {
+		logger.L().Ctx(ctx).Info("Path exclusions in effect",
+			helpers.String("root", filter.Root()),
+			helpers.Int("patterns", len(filter.Patterns())))
+		logger.L().Debug("Path exclusion patterns", helpers.Interface("patterns", filter.Patterns()))
+	}
+
+	return filter, nil
+}
+
+func getWorkloadFromHelmChart(ctx context.Context, path, helmPath, workloadPath string, helmValueOpts cautils.HelmValueOptions, depthOpt ...int) (map[string]reporthandling.Source, []workloadinterface.IMetadata, error) {
+	clonedRepo := cautils.GetClonedPath(path, depthOpt...)
+
+	if clonedRepo != "" {
+		// if the repo was cloned, add the workload path to the cloned repo
+		workloadPath = filepath.Join(clonedRepo, workloadPath)
+	} else {
+		// if the repo was not cloned
+		clonedRepo = path
+	}
+
+	// Get repo root
+	repoRoot, gitRepo := extractGitRepo(clonedRepo)
+
+	helmSourceToWorkloads, helmSourceToChart, _, err := cautils.LoadResourcesFromHelmCharts(ctx, helmPath, helmValueOpts)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	wlSource, ok := helmSourceToWorkloads[workloadPath]
+	if !ok {
+		return nil, nil, fmt.Errorf("workload %s not found in chart %s", workloadPath, helmPath)
+	}
+
+	if len(wlSource) != 1 {
+		return nil, nil, fmt.Errorf("workload %s found multiple times in chart %s", workloadPath, helmPath)
+	}
+
+	helmChart, ok := helmSourceToChart[workloadPath]
+	if !ok {
+		return nil, nil, fmt.Errorf("helmChart not found for workload %s", workloadPath)
+	}
+
+	workloadSource := getWorkloadSourceHelmChart(repoRoot, helmPath, gitRepo, helmChart)
+
+	workloadIDToSource := make(map[string]reporthandling.Source, 1)
+	workloadIDToSource[wlSource[0].GetID()] = workloadSource
+
+	var workloads []workloadinterface.IMetadata
+	workloads = append(workloads, wlSource...)
+
+	return workloadIDToSource, workloads, nil
+
+}
+
+func getWorkloadSourceHelmChart(repoRoot string, source string, gitRepo *cautils.LocalGitRepository, helmChart cautils.Chart) reporthandling.Source {
+	relSource, err := filepath.Rel(repoRoot, source)
+	if err == nil {
+		source = relSource
+	}
+
+	var lastCommit reporthandling.LastCommit
+	if gitRepo != nil {
+		commitInfo, _ := gitRepo.GetFileLastCommit(source)
+		if commitInfo != nil {
+			lastCommit = reporthandling.LastCommit{
+				Hash:           commitInfo.SHA,
+				Date:           commitInfo.Author.Date,
+				CommitterName:  commitInfo.Author.Name,
+				CommitterEmail: commitInfo.Author.Email,
+				Message:        commitInfo.Message,
+			}
+		}
+	}
+
+	return reporthandling.Source{
+		Path:             repoRoot,
+		HelmPath:         helmChart.Path,
+		RelativePath:     source,
+		FileType:         reporthandling.SourceTypeHelmChart,
+		HelmChartName:    helmChart.Name,
+		HelmTemplateFile: helmChart.Provenance.TemplateFile,
+		HelmValuesPaths:  helmChart.Provenance.ValuesPaths,
+		HelmTemplateLine: helmChart.Provenance.TemplateLine,
+		LastCommit:       lastCommit,
+	}
+}
+
+// resolveHelmRemotePath returns the repository-level remote path used to rewrite helm
+// chart provenance, or "" when this is not a cloned-repo scan or the remote URL is
+// unavailable — in which case callers fall back to local paths.
+func resolveHelmRemotePath(clonedRepo string, gitRepo *cautils.LocalGitRepository) string {
+	if clonedRepo == "" || gitRepo == nil {
+		return ""
+	}
+	url, err := gitRepo.GetRemoteUrl()
+	if err != nil {
+		logger.L().Warning("failed to get remote url, helm sources will use local paths", helpers.Error(err))
+		return ""
+	}
+	return strings.TrimSuffix(url, ".git")
+}
+
+// excludeFilesUnderDirectories drops entries from sourceToWorkloads whose source path falls
+// under any of dirs. Used to keep a nested Kustomize directory's local inputs out of the
+// plain-manifest results once that directory has already been rendered on its own, so the
+// transformed and raw identities of the same resource don't both end up in the scan.
+func excludeFilesUnderDirectories(sourceToWorkloads map[string][]workloadinterface.IMetadata, dirs []string) {
+	if len(dirs) == 0 {
+		return
+	}
+	for source := range sourceToWorkloads {
+		if cautils.IsUnderAnyDir(source, dirs) {
+			delete(sourceToWorkloads, source)
+		}
+	}
+}
+
+// getResourcesFromPath loads every scannable resource under path, from plain
+// manifests, helm charts and kustomize directories, and maps each workload to the
+// source file it came from. When workspace containment is configured via workspaceOpt,
+// external references and symlinks outside the workspace are contained or skipped.
+func getResourcesFromPath(ctx context.Context, path string, helmValueOpts cautils.HelmValueOptions, pathFilter *cautils.PathFilter, workspaceOpt ...string) (map[string]reporthandling.Source, []workloadinterface.IMetadata, []cautils.SkippedManifest, error) {
+	_, workloadIDToSource, workloads, skips, err := getResourcesFromInput(ctx, path, helmValueOpts, pathFilter, cautils.DefaultGitCloneDepth, workspaceOpt...)
+	return workloadIDToSource, workloads, skips, err
+}
+
+// getResourcesFromInput loads one scan input. It also returns the local root the
+// input's paths are reported against, or "" for a cloned remote repository, whose
+// temporary checkout must not leak into resource IDs.
+func getResourcesFromInput(ctx context.Context, path string, helmValueOpts cautils.HelmValueOptions, pathFilter *cautils.PathFilter, cloneDepth int, workspaceOpt ...string) (string, map[string]reporthandling.Source, []workloadinterface.IMetadata, []cautils.SkippedManifest, error) {
+	var workspaceDir string
+	if len(workspaceOpt) > 0 {
+		workspaceDir = workspaceOpt[0]
+	}
+
+	workloadIDToSource := make(map[string]reporthandling.Source)
+	var workloads []workloadinterface.IMetadata
+	var allSkips []cautils.SkippedManifest
+
+	clonedRepo := cautils.GetClonedPath(path, cloneDepth)
+	if clonedRepo != "" {
+		// if the repo was cloned, add the workload path to the cloned repo
+		path = clonedRepo
+	}
+
+	// Get repo root
+	repoRoot, gitRepo := extractGitRepo(path)
+
+	// when scanning a single file, we consider the repository root to be
+	// the directory of the scanned file. This applies to every file type: a
+	// JSON or Terraform file left as the root makes its own relative path ".",
+	// and the file is then reported without a source.
+	if info, err := os.Stat(repoRoot); err == nil && !info.IsDir() {
+		repoRoot = filepath.Dir(repoRoot)
+	}
+
+	// A broad directory input may contain Kustomize configurations below its root.
+	// Render them first so the generic Helm and plain-manifest passes can respect
+	// only the configurations whose builds actually succeeded.
+	kustomizeResult, err := cautils.LoadResourcesFromKustomizeDirectoriesFiltered(ctx, path, pathFilter, workspaceDir)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+
+	// Charts owned by a successful Kustomize build must not also be rendered as
+	// standalone Helm releases. Unreferenced charts remain in generic discovery.
+	var ownedHelmCharts []string
+	if workspaceDir != "" {
+		for _, d := range kustomizeResult.OwnedHelmChartDirectories {
+			if pathcontainment.IsPathContained(workspaceDir, d) {
+				ownedHelmCharts = append(ownedHelmCharts, d)
+			}
+		}
+	} else {
+		ownedHelmCharts = kustomizeResult.OwnedHelmChartDirectories
+	}
+	helmSourceToWorkloads, helmSourceToChart, renderedCharts, err := cautils.LoadResourcesFromHelmChartsFiltered(ctx, path, helmValueOpts, ownedHelmCharts, pathFilter, workspaceDir)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+
+	// load resource from local file system
+	// Kustomize-owned chart templates are covered by that build even though the
+	// generic Helm renderer left them alone. CRDs are filtered separately according
+	// to includeCRDs, so an omitted CRD remains available to the raw-file pass.
+	coveredChartDirectories := append(append([]string{}, renderedCharts...), ownedHelmCharts...)
+	sourceToWorkloads, fileSkips, err := cautils.LoadResourcesFromFilesFiltered(ctx, path, repoRoot, coveredChartDirectories, pathFilter, workspaceDir)
+	allSkips = append(allSkips, fileSkips...)
+	filesErr := err
+	if err != nil && !errors.Is(err, cautils.ErrNoManifestFiles) {
+		return "", nil, nil, allSkips, err
+	}
+	terraformSourceToWorkloads, err := cautils.LoadResourcesFromTerraformFiltered(ctx, path, pathFilter, workspaceDir)
+	if err != nil {
+		return "", nil, nil, allSkips, err
+	}
+	if filesErr != nil {
+		terraformWorkloads := 0
+		for _, ws := range terraformSourceToWorkloads {
+			terraformWorkloads += len(ws)
+		}
+		if terraformWorkloads == 0 {
+			return "", nil, nil, allSkips, filesErr
+		}
+	}
+
+	// merge Terraform-derived workloads, same pattern as the Kustomize block below
+	for source, ws := range terraformSourceToWorkloads {
+		workloads = append(workloads, ws...)
+		relSource, err := filepath.Rel(repoRoot, source)
+		if err == nil {
+			source = relSource
+		}
+
+		var lastCommit reporthandling.LastCommit
+		if gitRepo != nil {
+			if commitInfo, _ := gitRepo.GetFileLastCommit(source); commitInfo != nil {
+				lastCommit = reporthandling.LastCommit{
+					Hash:           commitInfo.SHA,
+					Date:           commitInfo.Author.Date,
+					CommitterName:  commitInfo.Author.Name,
+					CommitterEmail: commitInfo.Author.Email,
+					Message:        commitInfo.Message,
+				}
+			}
+		}
+
+		var workloadSource reporthandling.Source
+		if clonedRepo != "" {
+			workloadSource = reporthandling.Source{
+				Path:         "",
+				RelativePath: source,
+				FileType:     "Terraform",
+				LastCommit:   lastCommit,
+			}
+		} else {
+			workloadSource = reporthandling.Source{
+				Path:         repoRoot,
+				RelativePath: source,
+				FileType:     "Terraform",
+				LastCommit:   lastCommit,
+			}
+		}
+
+		for i := range ws {
+			workloadIDToSource[ws[i].GetID()] = workloadSource
+		}
+	}
+
+	// update workloads and workloadIDToSource
+	var warnIssued bool
+	for source, ws := range sourceToWorkloads {
+		// Kustomize can transform identity fields, so identity deduplication cannot
+		// reliably remove the corresponding raw input. Exclude only paths covered by
+		// successful builds; broken nested configurations retain their raw fallback.
+		if kustomizeResult.OwnsPlainFile(source) {
+			continue
+		}
+		workloads = append(workloads, ws...)
+
+		relSource, err := filepath.Rel(repoRoot, source)
+
+		if err == nil {
+			source = relSource
+		}
+
+		var filetype string
+		if cautils.IsYaml(source) {
+			filetype = reporthandling.SourceTypeYaml
+		} else if cautils.IsJson(source) {
+			filetype = reporthandling.SourceTypeJson
+		} else {
+			continue
+		}
+
+		var lastCommit reporthandling.LastCommit
+		if gitRepo != nil {
+			commitInfo, err := gitRepo.GetFileLastCommit(source)
+			if err != nil && !warnIssued {
+				logger.L().Debug("Git scan skipped", helpers.Error(err))
+				warnIssued = true // croak only once
+			}
+
+			if commitInfo != nil {
+				lastCommit = reporthandling.LastCommit{
+					Hash:           commitInfo.SHA,
+					Date:           commitInfo.Author.Date,
+					CommitterName:  commitInfo.Author.Name,
+					CommitterEmail: commitInfo.Author.Email,
+					Message:        commitInfo.Message,
+				}
+			}
+		}
+
+		// source falls back to the unmodified path when filepath.Rel failed above;
+		// relSource is empty there, and a source with no relative path is dropped
+		// outright by the SARIF and GitLab SAST printers
+		var workloadSource reporthandling.Source
+		if clonedRepo != "" {
+			workloadSource = reporthandling.Source{
+				Path:         "",
+				RelativePath: source,
+				FileType:     filetype,
+				LastCommit:   lastCommit,
+			}
+		} else {
+			workloadSource = reporthandling.Source{
+				Path:         repoRoot,
+				RelativePath: source,
+				FileType:     filetype,
+				LastCommit:   lastCommit,
+			}
+		}
+
+		for i := range ws {
+			workloadIDToSource[ws[i].GetID()] = workloadSource
+		}
+	}
+
+	if len(workloads) == 0 {
+		logger.L().Debug("files found in local storage", helpers.Int("files", len(sourceToWorkloads)), helpers.Int("workloads", len(workloads)))
+	}
+
+	helmRemotePath := resolveHelmRemotePath(clonedRepo, gitRepo)
+
+	// process the helm charts rendered above
+	for source, ws := range helmSourceToWorkloads {
+		workloads = append(workloads, ws...)
+		helmChart := helmSourceToChart[source]
+
+		chartRoot := repoRoot
+		if helmRemotePath != "" {
+			helmChart.Path = helmRemotePath
+			chartRoot = ""
+			source = strings.TrimPrefix(source, fmt.Sprintf("%s/", clonedRepo))
+		}
+
+		workloadSource := getWorkloadSourceHelmChart(chartRoot, source, gitRepo, helmChart)
+
+		for i := range ws {
+			workloadIDToSource[ws[i].GetID()] = workloadSource
+		}
+	}
+
+	if len(helmSourceToWorkloads) > 0 { // && len(helmSourceToNodes) > 0
+		logger.L().Debug("helm templates found in local storage", helpers.Int("helmTemplates", len(helmSourceToWorkloads)), helpers.Int("workloads", len(workloads)))
+	}
+
+	// lastCommitOf looks each file up once: several resources can come from one.
+	commits := map[string]reporthandling.LastCommit{}
+	lastCommitOf := func(file string) reporthandling.LastCommit {
+		if commit, ok := commits[file]; ok {
+			return commit
+		}
+		var lastCommit reporthandling.LastCommit
+		if gitRepo != nil {
+			commitInfo, _ := gitRepo.GetFileLastCommit(file)
+			if commitInfo != nil {
+				lastCommit = reporthandling.LastCommit{
+					Hash:           commitInfo.SHA,
+					Date:           commitInfo.Author.Date,
+					CommitterName:  commitInfo.Author.Name,
+					CommitterEmail: commitInfo.Author.Email,
+					Message:        commitInfo.Message,
+				}
+			}
+		}
+		commits[file] = lastCommit
+		return lastCommit
+	}
+
+	// update workloads and workloadIDToSource with workloads from Kustomize directories
+	for source, ws := range kustomizeResult.SourceToWorkloads {
+		workloads = append(workloads, ws...)
+		// GetWorkloads keys its result by the rendered Kustomize directory's own path, so source
+		// (before it is rewritten to a repo-relative path below) is that directory's name — the
+		// correct owner for each entry even when several Kustomize directories were rendered.
+		kustomizeDirectoryName := source
+		relSource, err := filepath.Rel(repoRoot, source)
+
+		if err == nil {
+			source = relSource
+		}
+
+		// Path carries the root RelativePath was computed against, so consumers can
+		// resolve the file without guessing at the scan's base
+		workloadSource := reporthandling.Source{
+			Path:                   repoRoot,
+			RelativePath:           source,
+			FileType:               reporthandling.SourceTypeKustomizeDirectory,
+			KustomizeDirectoryName: kustomizeDirectoryName,
+			LastCommit:             lastCommitOf(source),
+		}
+
+		for i := range ws {
+			id := ws[i].GetID()
+			workloadIDToSource[id] = kustomizeWorkloadSource(workloadSource, kustomizeResult.OriginFiles[id], repoRoot, lastCommitOf)
+		}
+	}
+
+	// Successful renderers already exclude their owned raw inputs. Preserve all
+	// remaining sources, even when their Kubernetes identities match.
+	if len(workloads) == 0 {
+		return "", nil, nil, allSkips, fmt.Errorf("no scannable Kubernetes resources found for input %q", path)
+	}
+
+	inputRoot := repoRoot
+	if clonedRepo != "" {
+		inputRoot = ""
+	}
+	return inputRoot, workloadIDToSource, workloads, allSkips, nil
+}
+
+// kustomizeWorkloadSource returns the source to report for one resource that a
+// Kustomize directory rendered. The directory is the fallback: it names the
+// build the resource came out of. When Kustomize recorded the file the resource
+// was read from, that file is reported instead, with its own last commit,
+// because it is the file a person would open to change the resource. The line
+// stays unreported on purpose: the rendered resource is the composition of a
+// base and its overlays, so no line in any one file is the line of a field.
+//
+// Only a file inside the scan root is used, after symlinks are resolved. One
+// outside it would make a path that is relative to the root escape it, which
+// printers that refuse such a location would then drop.
+func kustomizeWorkloadSource(directorySource reporthandling.Source, originFile, repoRoot string, lastCommitOf func(string) reporthandling.LastCommit) reporthandling.Source {
+	if originFile == "" || repoRoot == "" {
+		return directorySource
+	}
+	relative, err := filepath.Rel(repoRoot, originFile)
+	if err != nil || !filepath.IsLocal(relative) {
+		return directorySource
+	}
+	// IsLocal reads the text of the path only. A symlink inside the root whose
+	// target is outside it passes that test, and Kustomize reads through it, so
+	// the file it names would be one the scan has no business attributing a
+	// resource to. The check that follows symlinks decides; the path reported is
+	// still the one the repository shows.
+	if _, err := pathcontainment.ResolveContainedPath(repoRoot, originFile); err != nil {
+		return directorySource
+	}
+	source := directorySource
+	source.RelativePath = relative
+	source.LastCommit = lastCommitOf(relative)
+	return source
+}
+
+// extractGitRepo returns the root every reported path for this scan is relative to,
+// along with the git repository when its metadata is usable enough to attribute commits.
+func extractGitRepo(path string) (string, *cautils.LocalGitRepository) {
+	gitRepo, err := cautils.NewLocalGitRepository(path)
+	if err == nil && gitRepo != nil {
+		repoRoot, _ := gitRepo.GetRootDir()
+		return repoRoot, gitRepo
+	}
+
+	// The git metadata is unusable, but reported paths must still be anchored to the
+	// repository root when there is one, or a scan of a subdirectory loses its prefix
+	// and the paths resolve against nothing. Reuse the repository the constructor
+	// already opened rather than opening it a second time.
+	var repoRoot string
+	var rootErr error
+	if gitRepo != nil {
+		repoRoot, rootErr = gitRepo.GetRootDir()
+	} else {
+		repoRoot, rootErr = cautils.GetGitRootDir(path)
+	}
+
+	if rootErr == nil && repoRoot != "" {
+		// re-anchoring is invisible in the output otherwise, and any ancestor .git
+		// counts, including one left behind by a stray `git init`
+		if absPath, err := filepath.Abs(path); err != nil || absPath != repoRoot {
+			logger.L().Debug("anchoring reported paths on the repository root", helpers.String("root", repoRoot), helpers.String("scanPath", path))
+		}
+		return repoRoot, gitRepo
+	}
+
+	repoRoot, _ = filepath.Abs(path)
+	return repoRoot, gitRepo
+}
+
+func (fileHandler *FileResourceHandler) GetClusterAPIServerInfo(_ context.Context) *version.Info {
+	return nil
+}

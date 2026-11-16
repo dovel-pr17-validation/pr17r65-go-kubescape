@@ -1,0 +1,155 @@
+header:
+  schema-version: 2.2.0
+  last-updated: '2026-11-05'
+  last-reviewed: '2026-11-05'
+  url: https://raw.githubusercontent.com/kubescape/kubescape/master/security-insights.yml
+
+project:
+  name: Kubescape
+  administrators:
+    - name: Matthias Bertschy
+      social: https://github.com/matthyx
+      primary: true
+    - name: Ben Hirschberg
+      social: https://github.com/slashben
+      primary: false
+    - name: Rotem Refael
+      social: https://github.com/rotemamsa
+      primary: false
+    - name: Amir Malka
+      social: https://github.com/amirmalka
+      primary: false
+    - name: Bezalel Brandwine
+      social: https://github.com/Bezbran
+      primary: false
+  repositories:
+    - name: kubescape
+      url: https://github.com/kubescape/kubescape
+      comment: Kubescape CLI and microservice.
+  vulnerability-reporting:
+    reports-accepted: true
+    bug-bounty-available: false
+    policy: https://github.com/kubescape/project-governance/blob/main/SECURITY.md
+    contact:
+      name: Kubescape maintainers
+      email: cncf-kubescape-maintainers@lists.cncf.io
+      primary: true
+    comment: "Report vulnerabilities through GitHub private vulnerability reporting: https://github.com/kubescape/kubescape/security/advisories/new"
+  documentation:
+    design: https://github.com/kubescape/kubescape/blob/master/docs/architecture.md
+    detailed-guide: https://kubescape.io/docs/
+    code-of-conduct: https://github.com/kubescape/project-governance/blob/main/CODE_OF_CONDUCT.md
+    quickstart-guide: https://kubescape.io/docs/getting-started/
+    release-process: https://github.com/kubescape/kubescape/blob/master/.github/workflows/README.md#release-process
+
+repository:
+  url: https://github.com/kubescape/kubescape
+  status: active
+  accepts-change-request: true
+  accepts-automated-change-request: true
+  core-team:
+    - name: Matthias Bertschy
+      social: https://github.com/matthyx
+      primary: true
+    - name: Ben Hirschberg
+      social: https://github.com/slashben
+      primary: false
+    - name: Rotem Refael
+      social: https://github.com/rotemamsa
+      primary: false
+    - name: Amir Malka
+      social: https://github.com/amirmalka
+      primary: false
+    - name: Bezalel Brandwine
+      social: https://github.com/Bezbran
+      primary: false
+  license:
+    url: https://github.com/kubescape/kubescape/blob/master/LICENSE
+    expression: Apache-2.0
+  documentation:
+    contributing-guide: https://github.com/kubescape/project-governance/blob/main/CONTRIBUTING.md
+    governance: https://github.com/kubescape/project-governance/blob/main/GOVERNANCE.md
+    dependency-management-policy: https://github.com/kubescape/kubescape/blob/master/docs/environment-dependencies-policy.md
+    security-policy: https://github.com/kubescape/project-governance/blob/main/SECURITY.md
+    review-policy: https://github.com/kubescape/project-governance/blob/main/CONTRIBUTING.md#requirements-for-contributions
+  release:
+    automated-pipeline: true
+    distribution-points:
+      - uri: https://github.com/kubescape/kubescape/releases
+        comment: Binaries, packages, checksums, signatures and SBOMs.
+      - uri: https://quay.io/repository/kubescape/kubescape-cli
+        comment: CLI container image.
+      - uri: https://quay.io/repository/kubescape/kubescape
+        comment: Microservice container image.
+      - uri: https://github.com/kubernetes-sigs/krew-index/blob/master/plugins/kubescape.yaml
+        comment: kubectl plugin, updated by the release workflow.
+  security:
+    assessments:
+      self:
+        evidence: https://github.com/kubescape/kubescape/blob/master/docs/security/self-assessment.md
+        comment: Evidence-backed draft based on the 2024 CNCF assessment; incomplete pending maintainer review.
+    tools:
+      - name: Dependabot
+        type: SCA
+        rulesets:
+          - default
+        integration:
+          adhoc: true
+          ci: false
+          release: false
+        results: {}
+        comment: Weekly gomod and github-actions updates.
+      - name: gosec
+        type: SAST
+        rulesets:
+          - default
+        integration:
+          adhoc: false
+          ci: true
+          release: false
+        results: {}
+        comment: Runs through golangci-lint on pull requests.
+      - name: GitGuardian
+        type: secret
+        rulesets:
+          - default
+        integration:
+          adhoc: false
+          ci: true
+          release: false
+        results: {}
+        comment: GitGuardian Security Checks and secret-validator status checks run on pull requests alongside GitHub Secret Scanning and Push Protection.
+      - name: OpenSSF Scorecard
+        type: other
+        rulesets:
+          - default
+        integration:
+          adhoc: true
+          ci: true
+          release: false
+        results: {}
+        comment: Runs weekly and on every push to master.
+      - name: OSPS Baseline Action
+        type: other
+        rulesets:
+          - osps-baseline-2026-08
+        integration:
+          adhoc: true
+          ci: true
+          release: false
+        results: {}
+        comment: Runs on every push to master and weekly in .github/workflows/osps-baseline.yml. Results are in each run's summary and its osps-baseline-results artifact (https://github.com/kubescape/kubescape/actions/workflows/osps-baseline.yml); the action produces reports, not an attestation.
+      - name: OSPS Baseline scanner
+        type: other
+        rulesets:
+          - osps-baseline
+        integration:
+          adhoc: true
+          ci: false
+          release: false
+        results:
+          adhoc:
+            name: OSPS Baseline results on grc.store
+            location: https://grc.store/targets/kubescape/kubescape
+            predicate-uri: https://github.com/revanite-io/pvtr-publish-results
+        comment: Evaluated against maturity-1 and maturity-2 applicability and published to grc.store weekly and on demand.

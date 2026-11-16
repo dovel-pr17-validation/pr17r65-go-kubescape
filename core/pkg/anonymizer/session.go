@@ -1,0 +1,1530 @@
+package anonymizer
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"strconv"
+	"strings"
+
+	"github.com/kubescape/k8s-interface/cloudsupport"
+	cloudsupportv1 "github.com/kubescape/k8s-interface/cloudsupport/v1"
+	"github.com/kubescape/k8s-interface/workloadinterface"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/opa-utils/objectsenvelopes"
+	"github.com/kubescape/opa-utils/objectsenvelopes/hostsensor"
+	"github.com/kubescape/opa-utils/objectsenvelopes/localworkload"
+	"github.com/kubescape/opa-utils/reporthandling"
+	"github.com/kubescape/opa-utils/reporthandling/apis"
+	"github.com/kubescape/opa-utils/reporthandling/attacktrack/v1alpha1"
+	helpersv1 "github.com/kubescape/opa-utils/reporthandling/helpers/v1"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/prioritization"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/reportsummary"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/resourcesresults"
+	reporthandlingv2 "github.com/kubescape/opa-utils/reporthandling/v2"
+	rbacv1 "k8s.io/api/rbac/v1"
+	k8sjson "k8s.io/apimachinery/pkg/util/json"
+)
+
+// transformSession applies the supplied Transformer to sensitive resource
+// identifiers and metadata while preserving referential integrity across
+// the full OPA session. Transformation is transactional: callers either get
+// a completely transformed session or the original session remains untouched.
+func transformSession(session *cautils.OPASessionObj, _ *Mapping, transformer Transformer) error {
+	if session == nil {
+		return nil
+	}
+	if transformer == nil {
+		return errors.New("transformer is required")
+	}
+
+	transaction, err := cloneSessionForTransform(session)
+	if err != nil {
+		return err
+	}
+	if err := transformSessionInPlace(transaction.working, transformer); err != nil {
+		return err
+	}
+	return commitTransformedSession(session, transaction)
+}
+
+type sessionTransform struct {
+	working         *cautils.OPASessionObj
+	originalByClone map[workloadinterface.IMetadata]workloadinterface.IMetadata
+}
+
+// cloneSessionForTransform copies every field transformSessionInPlace may
+// mutate. It intentionally does not copy OPASessionObj itself because it owns
+// synchronization primitives. Read-only configuration is assigned directly.
+func cloneSessionForTransform(session *cautils.OPASessionObj) (*sessionTransform, error) {
+	working := &cautils.OPASessionObj{
+		LabelsToCopy:          append([]string(nil), session.LabelsToCopy...),
+		EnvVarSecretRefs:      session.EnvVarSecretRefs,
+		SourcePathsAnonymized: session.SourcePathsAnonymized,
+	}
+
+	resourcesResult, err := cloneJSON(session.ResourcesResult)
+	if err != nil {
+		return nil, fmt.Errorf("clone resource results: %w", err)
+	}
+	working.ResourcesResult = resourcesResult
+
+	resourceSource, err := cloneJSON(session.ResourceSource)
+	if err != nil {
+		return nil, fmt.Errorf("clone resource sources: %w", err)
+	}
+	working.ResourceSource = resourceSource
+
+	resourcesPrioritized, err := cloneJSON(session.ResourcesPrioritized)
+	if err != nil {
+		return nil, fmt.Errorf("clone prioritized resources: %w", err)
+	}
+	working.ResourcesPrioritized = resourcesPrioritized
+
+	// Attack-track values are not mutated by anonymization. Copy the map and
+	// each slice so key remapping cannot affect the caller before commit.
+	working.ResourceAttackTracks = make(map[string][]v1alpha1.IAttackTrack, len(session.ResourceAttackTracks))
+	for resourceID, tracks := range session.ResourceAttackTracks {
+		working.ResourceAttackTracks[resourceID] = append([]v1alpha1.IAttackTrack(nil), tracks...)
+	}
+
+	metadata, err := cloneJSON(session.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("clone report metadata: %w", err)
+	}
+	working.Metadata = metadata
+
+	report, err := clonePostureReport(session.Report)
+	if err != nil {
+		return nil, fmt.Errorf("clone posture report: %w", err)
+	}
+	working.Report = report
+
+	namespaceSummaries, err := cloneJSON(session.NamespaceSummaries)
+	if err != nil {
+		return nil, fmt.Errorf("clone namespace summaries: %w", err)
+	}
+	working.NamespaceSummaries = namespaceSummaries
+
+	exceptionAudit, err := cloneJSON(session.ExceptionAudit)
+	if err != nil {
+		return nil, fmt.Errorf("clone exception audit: %w", err)
+	}
+	working.ExceptionAudit = exceptionAudit
+
+	skippedManifests, err := cloneJSON(session.SkippedManifests)
+	if err != nil {
+		return nil, fmt.Errorf("clone skipped manifests: %w", err)
+	}
+	working.SkippedManifests = skippedManifests
+
+	// ScanCoverage is a value; only its skipped manifests are transformed, so
+	// a copy with its own slice is enough to keep the caller untouched.
+	working.ScanCoverage = session.ScanCoverage
+	if working.ScanCoverage.SkippedManifests, err = cloneJSON(session.ScanCoverage.SkippedManifests); err != nil {
+		return nil, fmt.Errorf("clone scan coverage skipped manifests: %w", err)
+	}
+
+	resources, originalByClone, err := cloneCatalog(session.GetCatalog())
+	if err != nil {
+		return nil, err
+	}
+	working.SetCatalog(cautils.NewMapResourceCatalog(resources))
+	return &sessionTransform{working: working, originalByClone: originalByClone}, nil
+}
+
+func cloneJSON[T any](value T) (T, error) {
+	var cloned T
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return cloned, err
+	}
+	// Interface-valued resource specs and rule evidence carry int64 values.
+	// encoding/json's float64 default rounds them beyond 2^53, even though
+	// anonymization is only supposed to change identifying strings.
+	if err := k8sjson.Unmarshal(raw, &cloned); err != nil {
+		return cloned, err
+	}
+	return cloned, nil
+}
+
+func clonePostureReport(report *reporthandlingv2.PostureReport) (*reporthandlingv2.PostureReport, error) {
+	cloned, err := cloneJSON(report)
+	if err != nil || report == nil {
+		return cloned, err
+	}
+	restoreControlSummaryFields(report.SummaryDetails.Controls, cloned.SummaryDetails.Controls)
+	for frameworkIndex, originalFramework := range report.SummaryDetails.Frameworks {
+		if frameworkIndex >= len(cloned.SummaryDetails.Frameworks) {
+			continue
+		}
+		restoreControlSummaryFields(
+			originalFramework.Controls,
+			cloned.SummaryDetails.Frameworks[frameworkIndex].Controls,
+		)
+	}
+	return cloned, nil
+}
+
+// restoreControlSummaryFields restores what JSON cloning drops from control
+// summaries. AllLists has an unexported backing map, so encoding/json cannot
+// retain its entries, and Description and Remediation are tagged json:"-".
+// The printers read the last two from the summary, the CSV remediation column
+// and the PolicyReport result message among them. They are control library
+// text, not resource data, so they are kept as they are.
+func restoreControlSummaryFields(original, cloned reportsummary.ControlSummaries) {
+	for controlID, originalControl := range original {
+		clonedControl, ok := cloned[controlID]
+		if !ok {
+			continue
+		}
+		resourceIDs := helpersv1.AllLists{}
+		resourceIDs.Initialize(len(originalControl.ResourceIDs.All()))
+		for resourceID, status := range originalControl.ResourceIDs.All() {
+			resourceIDs.Append(status, resourceID)
+		}
+		clonedControl.ResourceIDs = resourceIDs
+		clonedControl.Description = originalControl.Description
+		clonedControl.Remediation = originalControl.Remediation
+		cloned[controlID] = clonedControl
+	}
+}
+
+func cloneCatalog(catalog cautils.ResourceCatalog) (map[string]workloadinterface.IMetadata, map[workloadinterface.IMetadata]workloadinterface.IMetadata, error) {
+	resources := make(map[string]workloadinterface.IMetadata)
+	originalByClone := make(map[workloadinterface.IMetadata]workloadinterface.IMetadata)
+	if catalog == nil {
+		return resources, originalByClone, nil
+	}
+
+	var cloneErr error
+	catalog.ForEach(func(resourceID string, resource workloadinterface.IMetadata) bool {
+		if resource == nil {
+			return true
+		}
+		object := resource.GetObject()
+		if object == nil {
+			cloneErr = fmt.Errorf("clone resource %q: object is unavailable", resourceID)
+			return false
+		}
+		clonedObject, err := cloneResourceObject(object)
+		if err != nil {
+			cloneErr = fmt.Errorf("clone resource %q: %w", resourceID, err)
+			return false
+		}
+		cloned, err := cloneResourceEnvelope(resource, clonedObject)
+		if err != nil {
+			cloneErr = fmt.Errorf("clone resource %q: %w", resourceID, err)
+			return false
+		}
+		resources[resourceID] = cloned
+		originalByClone[cloned] = resource
+		return true
+	})
+	if cloneErr != nil {
+		return nil, nil, cloneErr
+	}
+	return resources, originalByClone, nil
+}
+
+// cloneResourceEnvelope wraps a cloned object in the same envelope type as the
+// original, so the clone is transformed the way the resource itself would be.
+// The envelope decides where the name and namespace live and how the resource
+// ID is built: a file-scan LocalWorkload prefixes the ID with its source path
+// hash, host-sensor, cloud-provider and API server data leave out the
+// namespace segment, and an RBAC subject keeps its name at the top level. The
+// transformed clone's ID becomes the resource's key in the results and the
+// committed original is stored under its own ID, so a clone that does not
+// report the original's ID would leave results that resolve to no resource;
+// cloning fails instead.
+func cloneResourceEnvelope(original workloadinterface.IMetadata, object map[string]any) (workloadinterface.IMetadata, error) {
+	var cloned workloadinterface.IMetadata
+	var err error
+	switch original.(type) {
+	case *localworkload.LocalWorkload:
+		if envelope := localworkload.NewLocalWorkload(object); envelope != nil {
+			cloned = envelope
+		}
+	case *objectsenvelopes.RegoResponseVectorObject:
+		cloned = objectsenvelopes.NewRegoResponseVectorObject(object)
+	case *hostsensor.HostSensorDataEnvelope:
+		cloned, err = decodeEnvelope[hostsensor.HostSensorDataEnvelope](object)
+	case *cloudsupportv1.CloudProviderDescribe:
+		cloned, err = decodeEnvelope[cloudsupportv1.CloudProviderDescribe](object)
+	case *cloudsupportv1.CloudProviderDescribeRepositories:
+		cloned, err = decodeEnvelope[cloudsupportv1.CloudProviderDescribeRepositories](object)
+	case *cloudsupportv1.CloudProviderListEntitiesForPolicies:
+		cloned, err = decodeEnvelope[cloudsupportv1.CloudProviderListEntitiesForPolicies](object)
+	case *cloudsupportv1.CloudProviderPolicyVersion:
+		cloned, err = decodeEnvelope[cloudsupportv1.CloudProviderPolicyVersion](object)
+	case *cloudsupport.ApiServerInfo:
+		var decoded workloadinterface.IMetadata
+		if decoded, err = decodeEnvelope[cloudsupport.ApiServerInfo](object); err == nil {
+			cloned = &apiServerInfoClone{ApiServerInfo: decoded.(*cloudsupport.ApiServerInfo)}
+		}
+	default:
+		cloned = workloadinterface.NewWorkloadObj(object)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("rebuild its %T envelope: %w", original, err)
+	}
+	if cloned == nil || cloned.GetID() != original.GetID() {
+		return nil, fmt.Errorf("cannot copy its %T envelope without changing its ID", original)
+	}
+	return cloned, nil
+}
+
+// decodeEnvelope rebuilds an envelope that keeps its object in typed fields.
+// Such an envelope's GetObject is the envelope itself marshaled to JSON, so
+// decoding the object back is the exact inverse; their SetObject is not
+// always (ApiServerInfo stores whatever it is given as its data).
+func decodeEnvelope[T any, P interface {
+	*T
+	workloadinterface.IMetadata
+}](object map[string]any) (workloadinterface.IMetadata, error) {
+	raw, err := json.Marshal(object)
+	if err != nil {
+		return nil, err
+	}
+	envelope := P(new(T))
+	if err := k8sjson.Unmarshal(raw, envelope); err != nil {
+		return nil, err
+	}
+	return envelope, nil
+}
+
+// commitResourceEnvelope returns the write that gives original the transformed
+// clone's content, keeping the original's pointer so every other holder of it
+// sees the anonymized values. It runs nothing itself, so the caller can
+// prepare every write before making any. Envelopes with typed fields take the
+// clone's fields, for the reason decodeEnvelope gives; the others take a copy
+// of its object through SetObject.
+func commitResourceEnvelope(original, transformed workloadinterface.IMetadata) (func(), error) {
+	switch target := original.(type) {
+	case *hostsensor.HostSensorDataEnvelope:
+		return assignEnvelope(target, transformed)
+	case *cloudsupportv1.CloudProviderDescribe:
+		return assignEnvelope(target, transformed)
+	case *cloudsupportv1.CloudProviderDescribeRepositories:
+		return assignEnvelope(target, transformed)
+	case *cloudsupportv1.CloudProviderListEntitiesForPolicies:
+		return assignEnvelope(target, transformed)
+	case *cloudsupportv1.CloudProviderPolicyVersion:
+		return assignEnvelope(target, transformed)
+	case *cloudsupport.ApiServerInfo:
+		source, ok := transformed.(*apiServerInfoClone)
+		if !ok {
+			return nil, fmt.Errorf("transformed resource is a %T, not a %T", transformed, source)
+		}
+		if source.err != nil {
+			return nil, fmt.Errorf("rebuild its %T envelope: %w", original, source.err)
+		}
+		return func() { *target = *source.ApiServerInfo }, nil
+	}
+	object, err := cloneResourceObject(transformed.GetObject())
+	if err != nil {
+		return nil, err
+	}
+	return func() { original.SetObject(object) }, nil
+}
+
+// apiServerInfoClone is the working copy of an ApiServerInfo. Unlike the
+// other typed envelopes, ApiServerInfo.SetObject stores the object it is given
+// as its data, so each transform helper's GetObject/SetObject round trip
+// nested the whole object one level deeper under data, leaving copies of the
+// encrypted name at paths such as data.data.metadata.name that DecryptReport
+// does not restore. SetObject here decodes the object back into the fields
+// instead, so the report keeps the envelope's own layout, with its name at
+// metadata.name. SetObject cannot return an error, so the first one is kept
+// and fails the commit.
+type apiServerInfoClone struct {
+	*cloudsupport.ApiServerInfo
+	err error
+}
+
+func (c *apiServerInfoClone) SetObject(object map[string]any) {
+	if c.err != nil {
+		return
+	}
+	decoded, err := decodeEnvelope[cloudsupport.ApiServerInfo](object)
+	if err != nil {
+		c.err = err
+		return
+	}
+	*c.ApiServerInfo = *decoded.(*cloudsupport.ApiServerInfo)
+}
+
+func assignEnvelope[T any, P interface {
+	*T
+	workloadinterface.IMetadata
+}](original P, transformed workloadinterface.IMetadata) (func(), error) {
+	source, ok := transformed.(P)
+	if !ok {
+		return nil, fmt.Errorf("transformed resource is a %T, not a %T", transformed, original)
+	}
+	return func() { *original = *source }, nil
+}
+
+// cloneResourceObject uses JSON as a representation-safe deep copy. Unlike
+// runtime.DeepCopyJSON, it accepts typed Kubernetes values such as
+// []corev1.Container that the scan pipeline keeps inside otherwise
+// unstructured resource maps.
+func cloneResourceObject(object map[string]any) (map[string]any, error) {
+	cloned, err := cloneJSON(object)
+	if err != nil {
+		return nil, fmt.Errorf("serialize resource object: %w", err)
+	}
+	return cloned, nil
+}
+
+func commitTransformedSession(session *cautils.OPASessionObj, transaction *sessionTransform) error {
+	working := transaction.working
+	type committedResource struct {
+		original workloadinterface.IMetadata
+		write    func()
+	}
+	updates := make([]committedResource, 0, len(transaction.originalByClone))
+	var commitErr error
+	working.GetCatalog().ForEach(func(_ string, transformed workloadinterface.IMetadata) bool {
+		original, ok := transaction.originalByClone[transformed]
+		if !ok {
+			return true
+		}
+		write, err := commitResourceEnvelope(original, transformed)
+		if err != nil {
+			commitErr = fmt.Errorf("prepare transformed resource for commit: %w", err)
+			return false
+		}
+		updates = append(updates, committedResource{original: original, write: write})
+		return true
+	})
+	if commitErr != nil {
+		return commitErr
+	}
+
+	committedResources := make(map[string]workloadinterface.IMetadata, len(transaction.originalByClone))
+	for _, update := range updates {
+		update.write()
+		committedResources[update.original.GetID()] = update.original
+	}
+	session.SetCatalog(cautils.NewMapResourceCatalog(committedResources))
+	session.ResourcesResult = working.ResourcesResult
+	session.ResourceSource = working.ResourceSource
+	session.SourcePathsAnonymized = working.SourcePathsAnonymized
+	session.ResourcesPrioritized = working.ResourcesPrioritized
+	session.ResourceAttackTracks = working.ResourceAttackTracks
+	session.Metadata = working.Metadata
+	session.Report = working.Report
+	session.NamespaceSummaries = working.NamespaceSummaries
+	session.ExceptionAudit = working.ExceptionAudit
+	session.SkippedManifests = working.SkippedManifests
+	session.ScanCoverage.SkippedManifests = working.ScanCoverage.SkippedManifests
+	return nil
+}
+
+func transformSessionInPlace(session *cautils.OPASessionObj, transformer Transformer) error {
+
+	idMapping := make(map[string]string)
+
+	newCatalog := cautils.NewMapResourceCatalog()
+	catalog := session.GetCatalog()
+	var transformErr error
+	if catalog != nil {
+		catalog.ForEach(func(oldID string, resource workloadinterface.IMetadata) bool {
+			if resource == nil {
+				return true
+			}
+
+			if err := transformResourceMetadata(resource, transformer); err != nil {
+				transformErr = err
+				return false
+			}
+
+			// RegoResponseVectorObject (RBAC subjects) embeds relatedObjects (roles, role bindings, local workloads).
+			// Anonymize their metadata, RBAC references, and sourcePath so neither the report nor GetID() leaks plaintext identifiers.
+			if err := transformRegoRelatedObjects(resource, transformer); err != nil {
+				transformErr = err
+				return false
+			}
+
+			// RBAC RoleBindings and ClusterRoleBindings carry subject and role references outside metadata.
+			if err := transformRBACBindingReferences(resource, transformer); err != nil {
+				transformErr = err
+				return false
+			}
+
+			// sourcePath may expose manifest filenames and line references
+			// (for example test-anonymize.yaml:1), so transform it alongside
+			// other resource-local metadata.
+			if err := transformResourceObjectSourcePath(resource, transformer); err != nil {
+				transformErr = err
+				return false
+			}
+
+			// Annotations may contain infrastructure identifiers, secret paths, or
+			// other sensitive metadata at both top-level and nested workload templates.
+			if err := transformResourceAnnotations(resource, transformer); err != nil {
+				transformErr = err
+				return false
+			}
+
+			// Container-related metadata is transformed separately to preserve the
+			// existing typed/unstructured traversal behavior while supporting
+			// multiple transformation strategies. session.EnvVarSecretRefs[oldID]
+			// is nil for a resource whose removeData pass found no reference-backed
+			// env vars; transformTypedEnv/transformUnstructuredEnv treat that the
+			// same as "no additional names to anonymize", which is correct.
+			if err := transformContainerMetadata(resource, session.EnvVarSecretRefs[oldID], transformer); err != nil {
+				transformErr = err
+				return false
+			}
+
+			if len(session.LabelsToCopy) > 0 {
+				if err := transformResourceLabels(resource, session.LabelsToCopy, transformer); err != nil {
+					transformErr = err
+					return false
+				}
+			}
+
+			newID := resource.GetID()
+			idMapping[oldID] = newID
+			newCatalog.Add(resource)
+			return true
+		})
+	}
+	if transformErr != nil {
+		return transformErr
+	}
+	session.SetCatalog(newCatalog)
+
+	exceptionAnonymizer := newExceptionTransformer(transformer)
+	newResourcesResult := make(map[string]resourcesresults.Result, len(session.ResourcesResult))
+	for oldID, result := range session.ResourcesResult {
+		newID, err := resolveMappedID(transformer, idMapping, oldID, "ref")
+		if err != nil {
+			return err
+		}
+		result.ResourceID = newID
+
+		if result.PrioritizedResource != nil {
+			result.PrioritizedResource.ResourceID = newID
+		}
+
+		for controlIndex := range result.AssociatedControls {
+			for ruleIndex := range result.AssociatedControls[controlIndex].ResourceAssociatedRules {
+				rule := &result.AssociatedControls[controlIndex].ResourceAssociatedRules[ruleIndex]
+
+				anonymizedExceptions, err := exceptionAnonymizer.policies(rule.Exception)
+				if err != nil {
+					return err
+				}
+				rule.Exception = anonymizedExceptions
+
+				for pathIndex := range rule.Paths {
+					// An empty ResourceID means the path is on this resource
+					// itself; transforming "" would name a resource that
+					// does not exist.
+					if rule.Paths[pathIndex].ResourceID == "" {
+						continue
+					}
+					mappedID, err := resolveMappedID(
+						transformer,
+						idMapping,
+						rule.Paths[pathIndex].ResourceID,
+						"ref",
+					)
+					if err != nil {
+						return err
+					}
+					rule.Paths[pathIndex].ResourceID = mappedID
+				}
+
+				for relatedIndex := range rule.RelatedResourcesIDs {
+					mappedID, err := resolveMappedID(
+						transformer,
+						idMapping,
+						rule.RelatedResourcesIDs[relatedIndex],
+						"ref",
+					)
+					if err != nil {
+						return err
+					}
+					rule.RelatedResourcesIDs[relatedIndex] = mappedID
+				}
+			}
+		}
+
+		newResourcesResult[newID] = result
+	}
+	session.ResourcesResult = newResourcesResult
+
+	if err := transformExceptionAudit(session.ExceptionAudit, exceptionAnonymizer, transformer, idMapping); err != nil {
+		return err
+	}
+
+	newResourceSource := make(map[string]reporthandling.Source, len(session.ResourceSource))
+
+	for oldID, source := range session.ResourceSource {
+		newID, err := resolveMappedID(transformer, idMapping, oldID, "ref")
+		if err != nil {
+			return err
+		}
+
+		if err := transformResourceSource(
+			&source,
+			transformer,
+		); err != nil {
+			return err
+		}
+
+		newResourceSource[newID] = source
+	}
+	session.ResourceSource = newResourceSource
+
+	// Every source path is now a pseudonym, so nothing downstream can open the
+	// manifest it came from. The evidence column reads these paths to resolve a
+	// finding's line, and recording the fact here - rather than re-deriving it
+	// from --hide or --encrypt at each reader - keeps it true by construction:
+	// whatever anonymizes the session says so.
+	session.SourcePathsAnonymized = true
+
+	newResourcesPrioritized := make(map[string]prioritization.PrioritizedResource, len(session.ResourcesPrioritized))
+	for oldID, prioritized := range session.ResourcesPrioritized {
+		newID, err := resolveMappedID(transformer, idMapping, oldID, "ref")
+		if err != nil {
+			return err
+		}
+		prioritized.ResourceID = newID
+		newResourcesPrioritized[newID] = prioritized
+	}
+	session.ResourcesPrioritized = newResourcesPrioritized
+
+	newResourceAttackTracks := make(map[string][]v1alpha1.IAttackTrack, len(session.ResourceAttackTracks))
+	for oldID, attackTracks := range session.ResourceAttackTracks {
+		newID, err := resolveMappedID(transformer, idMapping, oldID, "ref")
+		if err != nil {
+			return err
+		}
+		newResourceAttackTracks[newID] = attackTracks
+	}
+	session.ResourceAttackTracks = newResourceAttackTracks
+
+	if session.Metadata != nil {
+		if err := transformRepoContextMetadata(session.Metadata.ContextMetadata.RepoContextMetadata, transformer); err != nil {
+			return err
+		}
+		if err := transformDirectoryContextMetadata(session.Metadata.ContextMetadata.DirectoryContextMetadata, transformer); err != nil {
+			return err
+		}
+		if err := transformFileContextMetadata(session.Metadata.ContextMetadata.FileContextMetadata, transformer); err != nil {
+			return err
+		}
+		if err := transformClusterMetadata(session.Metadata.ContextMetadata.ClusterContextMetadata, transformer); err != nil {
+			return err
+		}
+		if err := transformClusterMetadata(&session.Metadata.ClusterMetadata, transformer); err != nil {
+			return err
+		}
+	}
+
+	if session.Report != nil {
+
+		if err := transformRepoContextMetadata(session.Report.Metadata.ContextMetadata.RepoContextMetadata, transformer); err != nil {
+			return err
+		}
+
+		if err := transformDirectoryContextMetadata(session.Report.Metadata.ContextMetadata.DirectoryContextMetadata, transformer); err != nil {
+			return err
+		}
+
+		if err := transformFileContextMetadata(session.Report.Metadata.ContextMetadata.FileContextMetadata, transformer); err != nil {
+			return err
+		}
+
+		if err := transformClusterMetadata(session.Report.Metadata.ContextMetadata.ClusterContextMetadata, transformer); err != nil {
+			return err
+		}
+
+		if err := transformClusterMetadata(&session.Report.Metadata.ClusterMetadata, transformer); err != nil {
+			return err
+		}
+
+		if err := remapControlResourceIDs(session.Report.SummaryDetails.Controls, transformer, idMapping); err != nil {
+			return err
+		}
+		for frameworkIndex := range session.Report.SummaryDetails.Frameworks {
+			if err := remapControlResourceIDs(session.Report.SummaryDetails.Frameworks[frameworkIndex].Controls, transformer, idMapping); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := transformNamespaceSummaries(session.NamespaceSummaries, transformer); err != nil {
+		return err
+	}
+
+	if err := transformSkippedManifests(session.SkippedManifests, transformer); err != nil {
+		return err
+	}
+	if err := transformSkippedManifests(session.ScanCoverage.SkippedManifests, transformer); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// transformSkippedManifests anonymizes the manifests the scan could not load.
+// Their paths are absolute local paths (home directory, project name), so
+// each gets the "src" pseudonym manifest source paths get: deterministic
+// under --hide, so entries stay distinguishable and a file keeps one name
+// across the report. The loader's reasons embed the same path, raw (an
+// os.PathError) or %q-quoted, so the path is replaced inside the reason too
+// and the rest of the diagnostic is kept.
+func transformSkippedManifests(skipped []cautils.SkippedManifest, transformer Transformer) error {
+	for i := range skipped {
+		original := skipped[i].Path
+		if original == "" {
+			continue
+		}
+		transformed, err := transformValue(transformer, "src", original)
+		if err != nil {
+			return err
+		}
+		skipped[i].Path = transformed
+		reason := strings.ReplaceAll(skipped[i].Reason, strconv.Quote(original), strconv.Quote(transformed))
+		skipped[i].Reason = strings.ReplaceAll(reason, original, transformed)
+	}
+	return nil
+}
+
+func remapControlResourceIDs(controls reportsummary.ControlSummaries, transformer Transformer, idMapping map[string]string) error {
+	for controlID, control := range controls {
+		remappedResourceIDs := control.ResourceIDs
+		originalResourceIDs := make(map[string]apis.ScanningStatus, len(control.ResourceIDs.All()))
+		maps.Copy(originalResourceIDs, control.ResourceIDs.All())
+		remappedResourceIDs.Clear()
+
+		for oldID, status := range originalResourceIDs {
+			newID, err := resolveMappedID(transformer, idMapping, oldID, "ref")
+			if err != nil {
+				return err
+			}
+			remappedResourceIDs.Append(status, newID)
+		}
+
+		control.ResourceIDs = remappedResourceIDs
+		controls[controlID] = control
+	}
+	return nil
+}
+
+// transformExceptionAudit anonymizes the --audit-exceptions report. Each item
+// names an exception and lists the resources it matched by ID, namespace and
+// name, which is the identity the rest of the session hides. The exception
+// name goes through the same memoized transformer as the exceptions attached
+// to rules, so an item and the exception it audits keep the same value, and
+// each resource ID is remapped through idMapping so it still points at the
+// resource's result. Status, counts, kinds and control and rule IDs carry no
+// identity and are kept.
+func transformExceptionAudit(audit *cautils.ExceptionAudit, exceptions *exceptionTransformer, transformer Transformer, idMapping map[string]string) error {
+	if audit == nil {
+		return nil
+	}
+	for i := range audit.Items {
+		item := &audit.Items[i]
+		name, err := exceptions.transform("exception", item.Name)
+		if err != nil {
+			return err
+		}
+		item.Name = name
+		for j := range item.MatchedResources {
+			match := &item.MatchedResources[j]
+			if match.ResourceID != "" {
+				if match.ResourceID, err = resolveMappedID(transformer, idMapping, match.ResourceID, "ref"); err != nil {
+					return err
+				}
+			}
+			if match.Namespace, err = transformValue(transformer, "ns", match.Namespace); err != nil {
+				return err
+			}
+			if match.Name, err = transformValue(transformer, "res", match.Name); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// transformNamespaceSummaries anonymizes the namespace name in each
+// NamespaceSummary in place. It reuses the "ns" prefix transformResourceMetadata
+// uses for a resource's own namespace, so a namespace gets the same pseudonym
+// here as everywhere else in the report. ClusterScopedNamespace is a
+// Kubescape-internal marker, not a real namespace, so it is left untouched.
+func transformNamespaceSummaries(summaries cautils.NamespaceSummaries, transformer Transformer) error {
+	for i := range summaries {
+		if summaries[i].Namespace == cautils.ClusterScopedNamespace {
+			continue
+		}
+		namespace, err := transformValue(transformer, "ns", summaries[i].Namespace)
+		if err != nil {
+			return err
+		}
+		summaries[i].Namespace = namespace
+	}
+	return nil
+}
+
+// resolveMappedID preserves referential integrity when IDs are rewritten during
+// anonymization, ensuring cross-references remain valid.
+func resolveMappedID(transformer Transformer, idMapping map[string]string, originalID, prefix string) (string, error) {
+
+	// Exact match (most common case)
+	if mappedID, ok := idMapping[originalID]; ok {
+		return mappedID, nil
+	}
+
+	// IDs that are not backed by a resource object still need the active
+	// transformation. In encrypted reports this keeps the fallback reversible;
+	// in hidden reports the mapping transformer retains deterministic aliases.
+	// Cache the fallback so every reference to the same missing resource uses
+	// one value even when the transformer uses randomized encryption.
+	mappedID, err := transformer.Transform(prefix, originalID)
+	if err != nil {
+		return "", err
+	}
+	idMapping[originalID] = mappedID
+	return mappedID, nil
+}
+
+// transformResourceLabels applies the supplied Transformer to labels
+// explicitly configured for copying into reports while preserving the
+// existing label selection behavior.
+func transformResourceLabels(resource workloadinterface.IMetadata, labelsToCopy []string, transformer Transformer) error {
+
+	bw, ok := resource.(workloadinterface.IWorkload)
+	if !ok {
+		return nil
+	}
+
+	labels := bw.GetLabels()
+	if len(labels) == 0 {
+		return nil
+	}
+
+	for _, key := range labelsToCopy {
+		if val, exists := labels[key]; exists && val != "" {
+
+			transformedValue, err := transformValue(
+				transformer,
+				"lbl",
+				val,
+			)
+			if err != nil {
+				return err
+			}
+
+			bw.SetLabel(
+				key,
+				transformedValue,
+			)
+		}
+	}
+
+	return nil
+}
+
+// transformResourceAnnotations applies the supplied Transformer to
+// annotation values throughout a resource object, including nested
+// workload templates such as Deployment pod specs.
+func transformResourceAnnotations(resource workloadinterface.IMetadata, transformer Transformer) error {
+
+	if resource == nil {
+		return nil
+	}
+
+	obj := resource.GetObject()
+	if obj == nil {
+		return nil
+	}
+
+	if err := transformAnnotationNodes(obj, transformer); err != nil {
+		return err
+	}
+
+	resource.SetObject(obj)
+
+	return nil
+}
+
+// transformResourceObjectSourcePath applies the supplied Transformer to
+// object.sourcePath while preserving trailing line-number context (for
+// example src-xxxx:12).
+func transformResourceObjectSourcePath(resource workloadinterface.IMetadata, transformer Transformer) error {
+
+	if resource == nil {
+		return nil
+	}
+
+	obj := resource.GetObject()
+	if obj == nil {
+		return nil
+	}
+
+	rawSourcePath, ok := obj["sourcePath"]
+	if !ok {
+		return nil
+	}
+
+	sourcePath, ok := rawSourcePath.(string)
+	if !ok || sourcePath == "" {
+		return nil
+	}
+
+	transformedSourcePath, err := transformSourcePath(
+		sourcePath,
+		transformer,
+	)
+	if err != nil {
+		return err
+	}
+
+	obj["sourcePath"] = transformedSourcePath
+	resource.SetObject(obj)
+
+	return nil
+}
+
+// transformSourcePath applies the supplied Transformer to the path portion
+// of a sourcePath while preserving any trailing line number (for example
+// src-xxxx:12).
+func transformSourcePath(sourcePath string, transformer Transformer) (string, error) {
+
+	lastColon := lastSourcePathColon(sourcePath)
+	if lastColon == -1 {
+		return transformValue(transformer, "src", sourcePath)
+	}
+
+	pathPart := sourcePath[:lastColon]
+	linePart := sourcePath[lastColon:]
+
+	if pathPart == "" {
+		return transformValue(transformer, "src", sourcePath)
+	}
+
+	transformedPath, err := transformValue(transformer, "src", pathPart)
+	if err != nil {
+		return "", err
+	}
+
+	return transformedPath + linePart, nil
+}
+
+// lastSourcePathColon returns the index of the colon separating a
+// sourcePath's file path from its trailing document-index suffix (for
+// example the ":12" in "src-xxxx:12"), or -1 if there is none. A leading
+// Windows drive letter (for example "C:\...") is skipped so it is never
+// mistaken for that separator, which would otherwise leave everything past
+// the drive letter untransformed.
+func lastSourcePathColon(sourcePath string) int {
+	searchFrom := 0
+	if len(sourcePath) >= 2 && sourcePath[1] == ':' && isASCIILetter(sourcePath[0]) {
+		searchFrom = 2
+	}
+
+	idx := strings.LastIndex(sourcePath[searchFrom:], ":")
+	if idx == -1 {
+		return -1
+	}
+
+	return idx + searchFrom
+}
+
+func isASCIILetter(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+// transformAnnotationNodes recursively traverses unstructured resource
+// objects, applying the supplied Transformer to annotation values
+// wherever metadata.annotations appears regardless of workload nesting.
+func transformAnnotationNodes(node any, transformer Transformer) error {
+
+	switch v := node.(type) {
+	case map[string]any:
+		if err := transformAnnotationMap(v, transformer); err != nil {
+			return err
+		}
+
+		for _, child := range v {
+			if err := transformAnnotationNodes(child, transformer); err != nil {
+				return err
+			}
+		}
+
+	case []any:
+		for _, item := range v {
+			if err := transformAnnotationNodes(item, transformer); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// transformAnnotationMap applies the supplied Transformer to annotation
+// values while preserving annotation keys, which remain meaningful
+// Kubernetes identifiers.
+func transformAnnotationMap(obj map[string]any, transformer Transformer) error {
+
+	rawMetadata, ok := obj["metadata"]
+	if !ok || rawMetadata == nil {
+		return nil
+	}
+
+	metadata, ok := rawMetadata.(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	rawAnnotations, ok := metadata["annotations"]
+	if !ok || rawAnnotations == nil {
+		return nil
+	}
+
+	annotations, ok := rawAnnotations.(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	for key, val := range annotations {
+		str, ok := val.(string)
+		if !ok || str == "" {
+			continue
+		}
+
+		transformedValue, err := transformValue(transformer, "ann", str)
+		if err != nil {
+			return err
+		}
+
+		annotations[key] = transformedValue
+	}
+
+	return nil
+}
+
+func transformValue(transformer Transformer, prefix string, value string) (string, error) {
+	if value == "" {
+		return value, nil
+	}
+
+	return transformer.Transform(prefix, value)
+}
+
+func transformResourceMetadata(
+	resource workloadinterface.IMetadata,
+	transformer Transformer,
+) error {
+
+	if resource == nil {
+		return nil
+	}
+
+	var err error
+
+	if name := resource.GetName(); name != "" {
+		name, err = transformValue(transformer, "res", name)
+		if err != nil {
+			return err
+		}
+
+		resource.SetName(name)
+	}
+
+	if namespace := resource.GetNamespace(); namespace != "" {
+		namespace, err = transformValue(transformer, "ns", namespace)
+		if err != nil {
+			return err
+		}
+
+		resource.SetNamespace(namespace)
+	}
+
+	return nil
+}
+
+// transformRegoRelatedObjects traverses the relatedObjects of a RegoResponseVectorObject
+// and transforms their metadata (names, namespaces), RBAC binding references, and sourcePath
+// so they do not leak plaintext identifiers into the serialized report or the composite
+// resource ID generated by GetID().
+func transformRegoRelatedObjects(
+	resource workloadinterface.IMetadata,
+	transformer Transformer,
+) error {
+	if resource == nil {
+		return nil
+	}
+
+	regoObj, ok := resource.(*objectsenvelopes.RegoResponseVectorObject)
+	if !ok {
+		return nil
+	}
+
+	rawRelated, ok := regoObj.GetObject()[objectsenvelopes.RelatedObjectsKey]
+	if !ok || rawRelated == nil {
+		return nil
+	}
+
+	transformEntry := func(m map[string]any) (map[string]any, error) {
+		obj := objectsenvelopes.NewObject(m)
+		if obj == nil {
+			return m, nil
+		}
+		if err := transformResourceMetadata(obj, transformer); err != nil {
+			return nil, err
+		}
+		if err := transformResourceObjectSourcePath(obj, transformer); err != nil {
+			return nil, err
+		}
+		if err := transformRBACBindingReferences(obj, transformer); err != nil {
+			return nil, err
+		}
+		if err := transformRegoRelatedObjects(obj, transformer); err != nil {
+			return nil, err
+		}
+		if updated := obj.GetObject(); updated != nil {
+			return updated, nil
+		}
+		return m, nil
+	}
+
+	switch relatedList := rawRelated.(type) {
+	case []map[string]any:
+		for i, item := range relatedList {
+			updated, err := transformEntry(item)
+			if err != nil {
+				return err
+			}
+			relatedList[i] = updated
+		}
+	case []any:
+		for i, item := range relatedList {
+			if m, ok := item.(map[string]any); ok {
+				updated, err := transformEntry(m)
+				if err != nil {
+					return err
+				}
+				relatedList[i] = updated
+			}
+		}
+	}
+
+	return nil
+}
+
+// isRBACBindingKind reports whether kind names a Kubernetes RBAC binding resource.
+func isRBACBindingKind(kind string) bool {
+	return kind == "RoleBinding" || kind == "ClusterRoleBinding"
+}
+
+// transformRBACBindingReferences anonymizes subject names/namespaces and roleRef
+// names on RoleBinding and ClusterRoleBinding objects consistently with their
+// corresponding subject ("res"/"ns") and role ("res") metadata.
+func transformRBACBindingReferences(
+	resource workloadinterface.IMetadata,
+	transformer Transformer,
+) error {
+	if resource == nil || !isRBACBindingKind(resource.GetKind()) {
+		return nil
+	}
+
+	obj := resource.GetObject()
+	if obj == nil {
+		return nil
+	}
+
+	if err := transformRBACSubjects(obj, transformer); err != nil {
+		return err
+	}
+	if err := transformRBACRoleRef(obj, transformer); err != nil {
+		return err
+	}
+
+	resource.SetObject(obj)
+	return nil
+}
+
+// transformRBACSubjects applies transformer to each entry's name and namespace in
+// an RBAC binding's subjects list.
+func transformRBACSubjects(obj map[string]any, transformer Transformer) error {
+	rawSubjects, ok := obj["subjects"]
+	if !ok || rawSubjects == nil {
+		return nil
+	}
+
+	switch subjects := rawSubjects.(type) {
+	case []map[string]any:
+		for _, subject := range subjects {
+			if err := transformRBACSubjectMap(subject, transformer); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, item := range subjects {
+			subject, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if err := transformRBACSubjectMap(subject, transformer); err != nil {
+				return err
+			}
+		}
+	case []rbacv1.Subject:
+		for i := range subjects {
+			if err := transformStringField(&subjects[i].Name, "res", transformer); err != nil {
+				return err
+			}
+			if err := transformStringField(&subjects[i].Namespace, "ns", transformer); err != nil {
+				return err
+			}
+		}
+		obj["subjects"] = subjects
+	}
+
+	return nil
+}
+
+// transformRBACSubjectMap transforms name and namespace on an unstructured RBAC subject map.
+func transformRBACSubjectMap(subject map[string]any, transformer Transformer) error {
+	if err := transformMapStringField(subject, "name", "res", transformer); err != nil {
+		return err
+	}
+	return transformMapStringField(subject, "namespace", "ns", transformer)
+}
+
+// transformRBACRoleRef transforms the referenced role name in an RBAC binding's roleRef.
+func transformRBACRoleRef(obj map[string]any, transformer Transformer) error {
+	rawRoleRef, ok := obj["roleRef"]
+	if !ok || rawRoleRef == nil {
+		return nil
+	}
+
+	switch roleRef := rawRoleRef.(type) {
+	case map[string]any:
+		return transformMapStringField(roleRef, "name", "res", transformer)
+	case rbacv1.RoleRef:
+		if err := transformStringField(&roleRef.Name, "res", transformer); err != nil {
+			return err
+		}
+		obj["roleRef"] = roleRef
+	case *rbacv1.RoleRef:
+		if roleRef != nil {
+			return transformStringField(&roleRef.Name, "res", transformer)
+		}
+	}
+
+	return nil
+}
+
+// transformMapStringField transforms a non-empty string value at key in m.
+func transformMapStringField(m map[string]any, key, prefix string, transformer Transformer) error {
+	if m == nil {
+		return nil
+	}
+	val, ok := m[key].(string)
+	if !ok || val == "" {
+		return nil
+	}
+	if err := transformStringField(&val, prefix, transformer); err != nil {
+		return err
+	}
+	m[key] = val
+	return nil
+}
+
+// transformStringField transforms a non-empty *string in place when present.
+func transformStringField(target *string, prefix string, transformer Transformer) error {
+	if target == nil || *target == "" {
+		return nil
+	}
+	transformed, err := transformValue(transformer, prefix, *target)
+	if err != nil {
+		return err
+	}
+	*target = transformed
+	return nil
+}
+
+func transformRepoContextMetadata(repo *reporthandlingv2.RepoContextMetadata, transformer Transformer) error {
+	if repo == nil {
+		return nil
+	}
+
+	repoCopy := *repo
+
+	var err error
+
+	repoCopy.Repo, err = transformValue(transformer, "git", repoCopy.Repo)
+	if err != nil {
+		return err
+	}
+
+	repoCopy.Owner, err = transformValue(transformer, "git", repoCopy.Owner)
+	if err != nil {
+		return err
+	}
+
+	repoCopy.Branch, err = transformValue(transformer, "git", repoCopy.Branch)
+	if err != nil {
+		return err
+	}
+
+	repoCopy.DefaultBranch, err = transformValue(transformer, "git", repoCopy.DefaultBranch)
+	if err != nil {
+		return err
+	}
+
+	repoCopy.RemoteURL, err = transformValue(transformer, "git", repoCopy.RemoteURL)
+	if err != nil {
+		return err
+	}
+
+	repoCopy.LocalRootPath, err = transformValue(transformer, "git", repoCopy.LocalRootPath)
+	if err != nil {
+		return err
+	}
+
+	if err := transformLastCommit(&repoCopy.LastCommit, transformer); err != nil {
+		return err
+	}
+
+	*repo = repoCopy
+
+	return nil
+}
+
+// transformClusterMetadata hides which cluster a report came from. The context
+// name is the entry the user selected in their kubeconfig, and the cloud names
+// are parsed straight out of it: for a GKE cluster "gke_project_zone_name" the
+// prefix is "gke_project_zone", so PrefixName and FullName carry the project
+// and, on EKS, the account ID out of the ARN. The provider and worker count
+// stay in cleartext - they describe the shape of the environment rather than
+// name it, and are what a shared report is usually read for.
+//
+// Namespace keys use the "ns" prefix so that under --hide they come out
+// string-identical to the namespaces transformResourceMetadata writes onto the
+// resources themselves; the per-namespace counts are only worth keeping if they
+// still join. Under --encrypt the two sides are separate ciphertexts, as every
+// repeated value in a report is, and the join reappears once both are
+// decrypted.
+func transformClusterMetadata(cluster *reporthandlingv2.ClusterMetadata, transformer Transformer) error {
+	if cluster == nil {
+		return nil
+	}
+
+	clusterCopy := *cluster
+
+	var err error
+
+	clusterCopy.ContextName, err = transformValue(transformer, "cluster", clusterCopy.ContextName)
+	if err != nil {
+		return err
+	}
+
+	if clusterCopy.CloudMetadata != nil {
+		cloudCopy := *clusterCopy.CloudMetadata
+
+		cloudCopy.FullName, err = transformValue(transformer, "cluster", cloudCopy.FullName)
+		if err != nil {
+			return err
+		}
+
+		cloudCopy.ShortName, err = transformValue(transformer, "cluster", cloudCopy.ShortName)
+		if err != nil {
+			return err
+		}
+
+		cloudCopy.PrefixName, err = transformValue(transformer, "cluster", cloudCopy.PrefixName)
+		if err != nil {
+			return err
+		}
+
+		clusterCopy.CloudMetadata = &cloudCopy
+	}
+
+	if clusterCopy.MapNamespaceToNumberOfResources != nil {
+		namespaceCounts := make(map[string]int, len(clusterCopy.MapNamespaceToNumberOfResources))
+
+		for namespace, count := range clusterCopy.MapNamespaceToNumberOfResources {
+			namespace, err = transformValue(transformer, "ns", namespace)
+			if err != nil {
+				return err
+			}
+
+			namespaceCounts[namespace] += count
+		}
+
+		clusterCopy.MapNamespaceToNumberOfResources = namespaceCounts
+	}
+
+	*cluster = clusterCopy
+
+	return nil
+}
+
+// transformDirectoryContextMetadata and transformFileContextMetadata hide where
+// the scan ran: the absolute path the user pointed at, which on most machines
+// carries their account name, and the machine itself. A directory scan records
+// the one, a single-file scan the other, and both survive into a report whose
+// whole purpose is to be shareable. The host uses a shared prefix so the same
+// machine reads as the same pseudonym either way.
+func transformDirectoryContextMetadata(directory *reporthandlingv2.DirectoryContextMetadata, transformer Transformer) error {
+	if directory == nil {
+		return nil
+	}
+
+	directoryCopy := *directory
+
+	var err error
+
+	directoryCopy.BasePath, err = transformValue(transformer, "dir", directoryCopy.BasePath)
+	if err != nil {
+		return err
+	}
+
+	directoryCopy.HostName, err = transformValue(transformer, "host", directoryCopy.HostName)
+	if err != nil {
+		return err
+	}
+
+	*directory = directoryCopy
+
+	return nil
+}
+
+func transformFileContextMetadata(file *reporthandlingv2.FileContextMetadata, transformer Transformer) error {
+	if file == nil {
+		return nil
+	}
+
+	fileCopy := *file
+
+	var err error
+
+	fileCopy.FilePath, err = transformValue(transformer, "file", fileCopy.FilePath)
+	if err != nil {
+		return err
+	}
+
+	fileCopy.HostName, err = transformValue(transformer, "host", fileCopy.HostName)
+	if err != nil {
+		return err
+	}
+
+	*file = fileCopy
+
+	return nil
+}
+
+func transformLastCommit(commit *reporthandling.LastCommit, transformer Transformer) error {
+	if commit == nil {
+		return nil
+	}
+
+	commitCopy := *commit
+
+	var err error
+
+	commitCopy.Hash, err = transformValue(transformer, "git", commitCopy.Hash)
+	if err != nil {
+		return err
+	}
+
+	commitCopy.CommitterName, err = transformValue(transformer, "git", commitCopy.CommitterName)
+	if err != nil {
+		return err
+	}
+
+	commitCopy.CommitterEmail, err = transformValue(transformer, "git", commitCopy.CommitterEmail)
+	if err != nil {
+		return err
+	}
+
+	commitCopy.Message, err = transformValue(transformer, "git", commitCopy.Message)
+	if err != nil {
+		return err
+	}
+
+	*commit = commitCopy
+
+	return nil
+}
+
+func transformResourceSource(
+	source *reporthandling.Source,
+	transformer Transformer,
+) error {
+	if source == nil {
+		return nil
+	}
+
+	sourceCopy := *source
+
+	if source.HelmValuesPaths != nil {
+		sourceCopy.HelmValuesPaths = append(
+			[]string(nil),
+			source.HelmValuesPaths...,
+		)
+	}
+
+	var err error
+
+	sourceCopy.Path, err = transformValue(transformer, "src", sourceCopy.Path)
+	if err != nil {
+		return err
+	}
+
+	sourceCopy.RelativePath, err = transformValue(transformer, "src", sourceCopy.RelativePath)
+	if err != nil {
+		return err
+	}
+
+	sourceCopy.HelmPath, err = transformValue(transformer, "src", sourceCopy.HelmPath)
+	if err != nil {
+		return err
+	}
+
+	sourceCopy.HelmChartName, err = transformValue(transformer, "src", sourceCopy.HelmChartName)
+	if err != nil {
+		return err
+	}
+
+	sourceCopy.HelmTemplateFile, err = transformValue(transformer, "src", sourceCopy.HelmTemplateFile)
+	if err != nil {
+		return err
+	}
+
+	sourceCopy.KustomizeDirectoryName, err = transformValue(transformer, "src", sourceCopy.KustomizeDirectoryName)
+	if err != nil {
+		return err
+	}
+
+	for i := range sourceCopy.HelmValuesPaths {
+		sourceCopy.HelmValuesPaths[i], err = transformValue(transformer, "src", sourceCopy.HelmValuesPaths[i])
+		if err != nil {
+			return err
+		}
+	}
+
+	if err := transformLastCommit(
+		&sourceCopy.LastCommit,
+		transformer,
+	); err != nil {
+		return err
+	}
+
+	*source = sourceCopy
+
+	return nil
+}

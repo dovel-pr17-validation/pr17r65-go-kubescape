@@ -1,0 +1,117 @@
+name: a-pr-scanner
+permissions:
+  contents: read
+  checks: read
+  actions: read
+  packages: read
+  pull-requests: read
+on:
+  workflow_call:
+    inputs:
+      RELEASE:
+        description: 'release'
+        required: true
+        type: string
+      CLIENT:
+        description: 'Client name'
+        required: true
+        type: string
+      UNIT_TESTS_PATH:
+        required: false
+        type: string
+        default: "./..."
+      GO111MODULE:
+        required: true
+        type: string
+      CGO_ENABLED:
+        type: number
+        default: 1
+      SKIP:
+        description: 'Skip the build, e.g. for a PR that changes no code'
+        type: boolean
+        default: false
+jobs:
+  unit-tests:
+    if: ${{ github.actor != 'kubescape' && !inputs.SKIP }}
+    name: Create cross-platform build
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    runs-on: ubuntu-large
+    timeout-minutes: 20
+    steps:
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        name: Installing go
+        with:
+          go-version-file: go.mod
+
+      - name: Test core pkg
+        run: ${{ env.DOCKER_CMD }} go test -race -v ./...
+
+      - name: Test cautils pkg with race detector
+        env:
+          CGO_ENABLED: 1
+        run: ${{ env.DOCKER_CMD }} go test -v -race ./core/cautils/...
+
+      - name: Check MCP structured errors
+        run: bash .github/scripts/check_mcp_errors.sh
+
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        name: Setup Syft
+
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        name: Build
+        with:
+          distribution: goreleaser
+          version: latest
+          args: build --clean --snapshot --single-target
+        env:
+          RELEASE: ${{ inputs.RELEASE }}
+          CLIENT: ${{ inputs.CLIENT }}
+          CGO_ENABLED: ${{ inputs.CGO_ENABLED }}
+
+      - name: Smoke Testing
+        env:
+          RELEASE: ${{ inputs.RELEASE }}
+          KUBESCAPE_SKIP_UPDATE_CHECK: "true"
+        run: ${{ env.DOCKER_CMD }} python3 smoke_testing/init.py ${PWD}/dist/cli_linux_amd64_v1/kubescape
+
+      - name: golangci-lint
+        continue-on-error: false
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0
+          args: --timeout 10m
+          only-new-issues: true
+
+  windows-tests:
+    if: ${{ github.actor != 'kubescape' && !inputs.SKIP }}
+    name: Windows core tests
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        name: Installing go
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Test Windows core package suite
+        run: go test -v -count=1 ./core/core
+
+      - name: Test Windows fixhandler locks
+        run: go test -v -count=1 ./core/pkg/fixhandler -run '^TestWindowsLock_'
+
+      - name: Test Windows partitionstore disk errors
+        run: go test -v -count=1 ./core/pkg/resourcehandler/partitionstore -run '^TestIsDiskFull_WindowsErrors$'
+
+      - name: Test Windows file watcher
+        run: go test -v -count=1 ./core/pkg/watch -run '^TestFileWatcher'

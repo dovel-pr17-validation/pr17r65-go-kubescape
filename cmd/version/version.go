@@ -1,0 +1,108 @@
+package version
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/kubescape/backend/pkg/versioncheck"
+	"github.com/kubescape/kubescape/v4/core/meta"
+	"github.com/spf13/cobra"
+	"sigs.k8s.io/yaml"
+)
+
+type versionInfo struct {
+	Version string `json:"version"`
+	Commit  string `json:"commit"`
+	Date    string `json:"date"`
+}
+
+func GetVersionCmd(ks meta.IKubescape, version, commit, date string) *cobra.Command {
+	var outputFormat string
+
+	versionCmd := &cobra.Command{
+		Use:   "version",
+		Short: "Get current version",
+		Long:  ``,
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if ks == nil {
+				return errors.New("uninitialized kubescape interface")
+			}
+			normalizedFormat := strings.ToLower(strings.TrimSpace(outputFormat))
+			if normalizedFormat == "" {
+				return fmt.Errorf("format cannot be empty, supported formats: text, json, yaml")
+			}
+
+			switch normalizedFormat {
+			case "json":
+				info := versionInfo{
+					Version: version,
+					Commit:  commit,
+					Date:    date,
+				}
+				b, err := json.Marshal(info)
+				if err != nil {
+					return fmt.Errorf("failed to marshal version info: %w", err)
+				}
+				_, err = fmt.Fprintln(cmd.OutOrStdout(), string(b))
+				return err
+			case "yaml":
+				info := versionInfo{
+					Version: version,
+					Commit:  commit,
+					Date:    date,
+				}
+				b, err := yaml.Marshal(info)
+				if err != nil {
+					return fmt.Errorf("failed to marshal version info: %w", err)
+				}
+				_, err = fmt.Fprint(cmd.OutOrStdout(), string(b))
+				return err
+			case "text":
+				ctx := cmd.Context()
+				if ks.Context() != nil {
+					ctx = ks.Context()
+				}
+				v := versioncheck.NewIVersionCheckHandler(ctx)
+				_ = v.CheckLatestVersion(ctx, versioncheck.NewVersionCheckRequest("", version, "", "", "version", nil))
+
+				out := cmd.OutOrStdout()
+				colored := shouldColor(out)
+				chalk := colorBuilder(colored)
+
+				verStr := version
+				commitStr := commit
+				dateStr := date
+
+				if colored {
+					if version != "" {
+						verStr = chalk.WithBrightGreen().Bold(version)
+					}
+					if commit != "" {
+						commitStr = chalk.BrightCyan(commit)
+					}
+					if date != "" {
+						dateStr = chalk.BrightWhite(date)
+					}
+				}
+
+				if _, err := fmt.Fprintf(out, "Your current version is: %s\n", verStr); err != nil {
+					return err
+				}
+				if _, err := fmt.Fprintf(out, "Build commit: %s\n", commitStr); err != nil {
+					return err
+				}
+				_, err := fmt.Fprintf(out, "Build date: %s\n", dateStr)
+				return err
+			default:
+				return fmt.Errorf("unsupported format %q, supported: text, json, yaml", outputFormat)
+			}
+		},
+	}
+
+	versionCmd.Flags().StringVarP(&outputFormat, "format", "f", "text", `Output format. Supported: "text", "json", "yaml"`)
+
+	return versionCmd
+}

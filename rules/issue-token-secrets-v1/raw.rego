@@ -1,0 +1,270 @@
+# regal ignore:directory-package-mismatch
+package armo_builtins
+
+import rego.v1
+
+# Write access to secrets in a privileged namespace lets a subject mint a
+# ServiceAccount token secret for an admin-equivalent SA and read the token
+# back out of it, which is a direct path to cluster admin.
+deny contains msga if {
+	subjectVector := input[_]
+	role := subjectVector.relatedObjects[i]
+	rolebinding := subjectVector.relatedObjects[j]
+	binds_privileged_namespace(role, rolebinding)
+
+	can_issue_token_secret(role)
+
+	subject := rolebinding.subjects[k]
+	is_same_subjects(subjectVector, subject)
+
+	# Verbs are evaluated across every secret-granting entry in the role rather
+	# than within a single one, because RBAC unions the entries: 'create' in one
+	# entry and 'get' in another is the same effective permission as both in one.
+	# The reported paths therefore span all contributing entries.
+	verb_path := sort([sprintf("relatedObjects[%d].rules[%d].verbs[%d]", [i, p, l]) |
+		some p
+		rule := role.rules[p]
+		targets_secrets(rule)
+		verb := rule.verbs[l]
+		verb in {"create", "get", "list", "watch", "update", "patch", "*"}
+	])
+
+	resources_path := sort([sprintf("relatedObjects[%d].rules[%d].resources[%d]", [i, p, l]) |
+		some p
+		rule := role.rules[p]
+		targets_secrets(rule)
+		resource := rule.resources[l]
+		resource in {"secrets", "*"}
+	])
+
+	api_groups_path := sort([sprintf("relatedObjects[%d].rules[%d].apiGroups[%d]", [i, p, a]) |
+		some p
+		rule := role.rules[p]
+		targets_secrets(rule)
+		apiGroup := rule.apiGroups[a]
+		apiGroup in {"", "*"}
+	])
+
+	path := array.concat(resources_path, verb_path)
+	path2 := array.concat(path, api_groups_path)
+	finalpath := array.concat(path2, [
+		sprintf("relatedObjects[%d].roleRef.name", [j]),
+		sprintf("relatedObjects[%d].subjects[%d]", [j, k]),
+	])
+
+	msga := {
+		"alertMessage": sprintf("Subject: %s-%s can write secrets in privileged namespaces and issue service account tokens", [subjectVector.kind, subjectVector.name]),
+		"alertScore": 9,
+		"packagename": "armo_builtins",
+		"reviewPaths": finalpath,
+		"failedPaths": finalpath,
+		"fixPaths": [],
+		"alertObject": {
+			"k8sApiObjects": [],
+			"externalObjects": subjectVector,
+		},
+	}
+}
+
+# Only the verb bundles that actually yield a usable token are reported, so that
+# a lone 'create' or a read-only grant does not raise an alert.
+
+# create + get, list or watch: create the token secret, then read the minted
+# token back. list and watch return the Secret's data just as get does.
+# A top-level create is authorized with the empty name (the object name is
+# unknown at authorization time), so the create has to come from an entry that
+# is unrestricted or lists "". The read may be name restricted — the subject
+# simply creates the secret under that name and reads it back (a narrowed list
+# or watch needs a metadata.name field selector to match). A get has to admit a
+# real name, as "" is never the name of a secret, while an unfiltered list or
+# watch is authorized with "" itself.
+can_issue_token_secret(role) if {
+	grants_unnamed(role, "create")
+	some verb in {"get", "list", "watch"}
+	grants_readable(role, verb)
+}
+
+# create + patch: server side apply can bring the secret into existence even
+# when every entry is restricted with resourceNames, which is what makes a named
+# create reachable at all. The create and the patch have to reach one common
+# secret name: create on "a" and patch on "b" cannot create either secret.
+can_issue_token_secret(role) if {
+	create_rule := role.rules[_]
+	targets_secrets(create_rule)
+	create_rule.verbs[_] in {"create", "*"}
+	patch_rule := role.rules[_]
+	targets_secrets(patch_rule)
+	patch_rule.verbs[_] in {"patch", "*"}
+	names_overlap(create_rule, patch_rule)
+}
+
+# A create and a patch reach a common object when either is not narrowed to
+# names, or when both name the same object. The names are literal: RBAC has no
+# wildcard form for resourceNames. An empty name is the one a plain create is
+# authorized with and is not an object that apply could create, so it never
+# counts as the common name. A create entry that lists "" is a plain create
+# under any name, so it reaches whatever object the patch names.
+names_overlap(create_rule, patch_rule) if {
+	grants_unnamed_requests(create_rule)
+	unrestricted_rule(patch_rule)
+}
+
+names_overlap(create_rule, patch_rule) if {
+	grants_unnamed_requests(create_rule)
+	names_an_object(patch_rule)
+}
+
+names_overlap(create_rule, patch_rule) if {
+	names_an_object(create_rule)
+	unrestricted_rule(patch_rule)
+}
+
+names_overlap(create_rule, patch_rule) if {
+	name := create_rule.resourceNames[_]
+	name != ""
+	name in patch_rule.resourceNames
+}
+
+names_an_object(rule) if {
+	name := rule.resourceNames[_]
+	name != ""
+}
+
+# blanket update or patch over unnamed secrets: overwrite an existing secret and
+# turn it into a SA token secret. With resourceNames the named secret most
+# likely already exists and is not of that type.
+can_issue_token_secret(role) if {
+	grants_unrestricted(role, "update")
+}
+
+can_issue_token_secret(role) if {
+	grants_unrestricted(role, "patch")
+}
+
+# true if an entry in the role that is not narrowed with resourceNames grants
+# @verb over secrets
+grants_unrestricted(role, verb) if {
+	rule := role.rules[_]
+	targets_secrets(rule)
+	unrestricted_rule(rule)
+	rule.verbs[_] in {verb, "*"}
+}
+
+# as above, but from entries that admit the empty name a create is authorized
+# with: an unrestricted entry, or one whose resourceNames lists ""
+grants_unnamed(role, verb) if {
+	rule := role.rules[_]
+	targets_secrets(rule)
+	grants_unnamed_requests(rule)
+	rule.verbs[_] in {verb, "*"}
+}
+
+# as above, but from entries that can reach an existing secret by its name,
+# which is never empty: an unrestricted entry, or one that names a secret.
+# An entry whose resourceNames lists only "" reaches no secret this way.
+grants_readable(role, verb) if {
+	rule := role.rules[_]
+	targets_secrets(rule)
+	reaches_existing_secret(rule)
+	rule.verbs[_] in {verb, "*"}
+}
+
+# A list or watch without a metadata.name field selector is authorized with the
+# empty name and returns every secret, so an entry that lists "" reads the
+# token through the collection.
+grants_readable(role, verb) if {
+	verb in {"list", "watch"}
+	rule := role.rules[_]
+	targets_secrets(rule)
+	"" in rule.resourceNames
+	rule.verbs[_] in {verb, "*"}
+}
+
+reaches_existing_secret(rule) if unrestricted_rule(rule)
+
+reaches_existing_secret(rule) if names_an_object(rule)
+
+# Kubernetes draws no distinction between an absent resourceNames and an
+# explicitly empty one: ResourceNameMatches returns true as soon as the list is
+# empty, so both mean the rule is not narrowed to named objects. Testing
+# definedness alone (not rule.resourceNames) would treat resourceNames: [] as
+# scoped and skip a subject that in fact holds unrestricted access.
+unrestricted_rule(rule) if {
+	count(resource_names(rule)) == 0
+}
+
+# A create, like a list or watch across a collection, is authorized with the
+# empty name, so resourceNames: [""] grants it as an unrestricted entry does.
+grants_unnamed_requests(rule) if unrestricted_rule(rule)
+
+grants_unnamed_requests(rule) if "" in rule.resourceNames
+
+targets_secrets(rule) if {
+	rule.resources[_] in {"secrets", "*"}
+	rule.apiGroups[_] in {"", "*"}
+}
+
+# A ClusterRoleBinding grants the role in every namespace, a RoleBinding only in
+# its own.
+binds_privileged_namespace(role, rolebinding) if {
+	endswith(role.kind, "Role")
+	endswith(rolebinding.kind, "Binding")
+
+	rolebinding.roleRef.kind == role.kind
+	rolebinding.roleRef.name == role.metadata.name
+	is_same_namespace(role, rolebinding)
+
+	affects_privileged_namespace(rolebinding)
+}
+
+affects_privileged_namespace(rolebinding) if {
+	rolebinding.kind == "ClusterRoleBinding"
+}
+
+affects_privileged_namespace(rolebinding) if {
+	rolebinding.kind == "RoleBinding"
+	rolebinding.metadata.namespace == "kube-system"
+}
+
+is_same_namespace(role, rolebinding) if {
+	role.kind == "ClusterRole"
+}
+
+is_same_namespace(role, rolebinding) if {
+	role.kind == "Role"
+	role.metadata.namespace == rolebinding.metadata.namespace
+}
+
+is_same_subjects(subjectVector, subject) if {
+	subjectVector.kind == subject.kind
+	subjectVector.name == subject.name
+	subjectVector.namespace == subject.namespace
+}
+
+is_same_subjects(subjectVector, subject) if {
+	subjectVector.kind == subject.kind
+	subjectVector.name == subject.name
+	subjectVector.apiGroup == subject.apiGroup
+}
+
+# A subject can carry neither qualifier. A ServiceAccount subject of a
+# RoleBinding may leave out its namespace, which the authorizer then reads as
+# the binding's own, and its apiGroup is empty, so the API server returns the
+# subject with neither field set. A User or Group manifest may also leave out
+# apiGroup, which the API server defaults. Both clauses above need one of the
+# fields to be present, so read them with a default here instead.
+is_same_subjects(subjectVector, subject) if {
+	subjectVector.kind == subject.kind
+	subjectVector.name == subject.name
+	object.get(subjectVector, "namespace", "") == object.get(subject, "namespace", "")
+	object.get(subjectVector, "apiGroup", "") == object.get(subject, "apiGroup", "")
+}
+
+# resource_names is a rule's resourceNames with an absent or null list read as
+# the empty list. Kubernetes treats all three alike: ResourceNameMatches matches
+# as soon as the list is empty, so the rule is not narrowed to named objects.
+# Counting a null list directly is undefined and would drop the rule instead.
+resource_names(rule) := names if {
+	names := object.get(rule, "resourceNames", [])
+	names != null
+} else := []

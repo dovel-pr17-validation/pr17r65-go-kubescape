@@ -1,0 +1,176 @@
+package fixhandler
+
+import (
+	"os"
+	"sort"
+	"strings"
+
+	"github.com/armosec/armoapi-go/armotypes"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	metav1 "github.com/kubescape/kubescape/v4/core/meta/datastructures/v1"
+	"github.com/kubescape/opa-utils/reporthandling"
+	reporthandlingv2 "github.com/kubescape/opa-utils/reporthandling/v2"
+)
+
+// FixHandler is a struct that holds the information of the report to be fixed
+type FixHandler struct {
+	fixInfo       *metav1.FixInfo
+	reportObj     *reporthandlingv2.PostureReport
+	localBasePath string
+	// sourceRoot, when set by an embedded caller, anchors manifest reads to a
+	// directory descriptor instead of reopening report-supplied paths by name.
+	sourceRoot *os.Root
+	controls   controlSelector
+
+	// unfixedControls is populated by PrepareResourcesToFix with every failed
+	// (resource, control) tuple that the fixer cannot or will not auto-remediate.
+	unfixedControls []UnfixedControl
+	// fixedControlsCount is the number of failed (resource, control) tuples that
+	// produced at least one yaml expression to apply.
+	fixedControlsCount int
+	// fixedControls records the same tuples fixedControlsCount counts, so a
+	// caller can tell which control on which resource was remediated rather
+	// than only how many. It is kept in step with fixedControlsCount: every
+	// place that withdraws a resource's fixed controls withdraws these too.
+	fixedControls []UnfixedControl
+}
+
+// ResourceFixInfo is a struct that holds the information about the resource that needs to be fixed
+type ResourceFixInfo struct {
+	YamlExpressions map[string]armotypes.FixPath
+	Resource        *reporthandling.Resource
+	FilePath        string
+	DocumentIndex   int
+
+	// relativePath is FilePath as the report recorded it, relative to the
+	// resource's own base path. OutputPaths mirrors it under --output-dir.
+	relativePath string
+
+	// failedControls and fixedCount let a resource be withdrawn after its
+	// controls have already been tallied: the entries are re-reported as
+	// unfixed and the count of fully fixed controls is given back.
+	failedControls []UnfixedControl
+	fixedCount     int
+	// fixedControls are the entries of failedControls the fixer counted in
+	// fixedCount, so they can be recorded and withdrawn with it.
+	fixedControls []UnfixedControl
+	fileKey       string
+
+	// inMemory marks a resource with no manifest on disk — a live object from a
+	// cluster scan. Its fix is rendered from the scanned object by RenderFixes
+	// rather than written back by ApplyChanges, and FilePath is empty.
+	inMemory bool
+}
+
+// HelmFixSuggestion describes a fix for a Helm-rendered resource. We do not
+// edit chart templates directly: the rendered line numbers in the yq fix paths
+// don't reliably map back to template lines (this was the underlying bug
+// behind PRs #1215/#1551/#1620/#1628 and the rationale for issue #1772).
+// Instead, we surface the rule's fix path together with the .Values.* keys
+// statically referenced by the source template, so the user can edit
+// values.yaml deliberately.
+type HelmFixSuggestion struct {
+	Resource     *reporthandling.Resource
+	ChartPath    string              // on-disk chart root (Source.HelmPath)
+	ChartName    string              // Source.HelmChartName
+	TemplateFile string              // chart-relative, e.g. "templates/deployment.yaml"
+	ValuesPaths  []string            // candidate dotted .Values.* keys referenced by the template; may be empty
+	FixPaths     []armotypes.FixPath // rule-suggested rendered-YAML edits, for the user to translate into values.yaml
+
+	// FidelityProvenance establishes that Resource.Object is a complete, unredacted
+	// representation (e.g. from an unredacted rendered source).
+	FidelityProvenance bool
+	// UnredactedBase provides a verified unredacted base object, when available.
+	UnredactedBase map[string]interface{}
+
+	// HelmValueOptions carries the render inputs (values files, set overrides, release identity)
+	// used to reproduce the scanned resource.
+	HelmValueOptions cautils.HelmValueOptions
+	// AllowedBasePath restricts on-disk chart reading to the allowed base directory boundary.
+	AllowedBasePath string
+}
+
+// UnfixedControl describes a failed (resource, control) tuple for which `kubescape fix`
+// did not produce an automatic remediation. The user must address these manually.
+type UnfixedControl struct {
+	ControlID     string
+	ControlName   string
+	ResourceName  string
+	ResourceKind  string
+	FilePath      string
+	ResourceID    string
+	DocumentIndex int
+	// Reason is a short, user-facing explanation of why this control was not auto-fixed
+	// (e.g. "no auto-fix available", "skipped: file not found", "skipped: not a YAML source").
+	Reason string
+}
+
+func withNewline(content, targetNewline string) string {
+	replaceNewlines := map[string]bool{
+		unixNewline:    true,
+		windowsNewline: true,
+		oldMacNewline:  true,
+	}
+	replaceNewlines[targetNewline] = false
+
+	newlinesToReplace := make([]string, len(replaceNewlines))
+	i := 0
+	for k := range replaceNewlines {
+		newlinesToReplace[i] = k
+		i++
+	}
+
+	// To ensure that we fully replace Windows newlines (CR LF), and not
+	// corrupt them into two new newlines (CR CR or LF LF) by partially
+	// replacing either CR or LF, we have to ensure we replace longer
+	// Windows newlines first
+	sort.Slice(newlinesToReplace, func(i int, j int) bool {
+		return len(newlinesToReplace[i]) > len(newlinesToReplace[j])
+	})
+
+	// strings.Replacer takes a flat list of (oldVal, newVal) pairs, so we
+	// need to allocate twice the space and assign accordingly
+	newlinesOldNew := make([]string, 2*len(replaceNewlines))
+	i = 0
+	for _, nl := range newlinesToReplace {
+		newlinesOldNew[2*i] = nl
+		newlinesOldNew[2*i+1] = targetNewline
+		i++
+	}
+
+	replacer := strings.NewReplacer(newlinesOldNew...)
+	return replacer.Replace(content)
+}
+
+// ControlOutcome is the fixer's verdict on one failed (resource, control) tuple
+// from the most recent call to PrepareResourcesToFix.
+//
+// Granularity: a patch is planned per resource, not per control. Fixed means
+// the fixer counted the control as fully remediated by that resource's planned
+// expressions, either because every one of the control's failed paths produced
+// an expression or because another control's planned paths cover them. It does
+// not mean an expression exists that is specific to this control, and it says
+// nothing about whether the patch has been, or will be, written anywhere.
+type ControlOutcome struct {
+	ControlID     string
+	ControlName   string
+	ResourceID    string
+	ResourceName  string
+	ResourceKind  string
+	DocumentIndex int
+	// FilePath is the manifest the resource was read from. It is empty for a
+	// resource of a cluster report, which has no manifest.
+	FilePath string
+	// InMemory reports that the resource is a live cluster object whose fix is
+	// rendered by RenderFixes, not written to a file.
+	InMemory bool
+	// Fixed is true when the control was counted by FixedControlsCount.
+	Fixed bool
+	// Partial is true for an unfixed control that some of whose failed paths
+	// did produce expressions. Those expressions are still part of the
+	// resource's plan; the control is unfixed because others were not.
+	Partial bool
+	// Reason is the fixer's own reason for an unfixed control, verbatim. It is
+	// empty when Fixed is true.
+	Reason string
+}

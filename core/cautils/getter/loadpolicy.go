@@ -1,0 +1,573 @@
+package getter
+
+import (
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"syscall"
+
+	"github.com/armosec/armoapi-go/armotypes"
+	"github.com/kubescape/go-logger"
+	"github.com/kubescape/go-logger/helpers"
+	"github.com/kubescape/opa-utils/reporthandling"
+	"github.com/kubescape/opa-utils/reporthandling/attacktrack/v1alpha1"
+)
+
+// =======================================================================================================================
+// ============================================== LoadPolicy =============================================================
+// =======================================================================================================================
+// maxPolicyFileBytes is the maximum allowed size for local policy files (32 MiB),
+// matching cautils.DefaultMaxFileSize to prevent uncontrolled resource consumption
+// from oversized inputs or decompression bombs (CWE-400).
+const maxPolicyFileBytes int64 = 32 * 1024 * 1024
+
+var (
+	DefaultLocalStore = getCacheDir()
+
+	ErrNotImplemented       = errors.New("feature is currently not supported")
+	ErrNotFound             = errors.New("name not found")
+	ErrNameRequired         = errors.New("missing required input framework name")
+	ErrIDRequired           = errors.New("missing required input control ID")
+	ErrFrameworkNotMatching = errors.New("framework from file not matching")
+	ErrControlNotMatching   = errors.New("control from file not matching")
+	ErrControlAmbiguous     = errors.New("control identifier matches more than one control")
+	// ErrCatalogUnavailable is returned when none of the local policy files
+	// could be read as a control or a framework with controls, so nothing can
+	// be said about whether a control exists.
+	ErrCatalogUnavailable = errors.New("no usable local policy catalog")
+
+	// ErrPolicyNotRegular is returned when a policy file is not a regular file.
+	ErrPolicyNotRegular = errors.New("policy file is not a regular file")
+	// ErrPolicyTooLarge is returned when a policy file exceeds the maximum allowed size.
+	ErrPolicyTooLarge = errors.New("policy file exceeds maximum size limit")
+)
+
+// openPolicyFile opens path for reading and rejects anything but a regular file.
+// A pre-open stat check prevents opening device nodes (e.g. tape or character devices).
+// O_NONBLOCK keeps opening a FIFO from waiting for a writer, and descriptor-based
+// validation ensures a path swapped after stat cannot slip past. The original path
+// is passed directly to preserve symlink traversal semantics.
+func openPolicyFile(path string) (*os.File, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, os.ErrNotExist
+	}
+	statInfo, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if statInfo.IsDir() {
+		return nil, fmt.Errorf("%q is a directory, not a file", path)
+	}
+	if !statInfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: %q", ErrPolicyNotRegular, path)
+	}
+
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	if info.IsDir() {
+		file.Close()
+		return nil, fmt.Errorf("%q is a directory, not a file", path)
+	}
+	if !info.Mode().IsRegular() {
+		file.Close()
+		return nil, fmt.Errorf("%w: %q", ErrPolicyNotRegular, path)
+	}
+	return file, nil
+}
+
+// readPolicyFile returns the contents of the policy file at path, reading at most
+// maxPolicyFileBytes bytes so that reading remains bounded.
+func readPolicyFile(path string) ([]byte, error) {
+	file, err := openPolicyFile(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err == nil && info.Size() > maxPolicyFileBytes {
+		return nil, fmt.Errorf("%w: %q exceeds the %d byte limit", ErrPolicyTooLarge, path, maxPolicyFileBytes)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(file, maxPolicyFileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxPolicyFileBytes {
+		return nil, fmt.Errorf("%w: %q exceeds the %d byte limit", ErrPolicyTooLarge, path, maxPolicyFileBytes)
+	}
+	return data, nil
+}
+
+// ReadPolicyFile returns the contents of the policy file at path, reading at most
+// maxPolicyFileBytes bytes so that reading remains bounded (CWE-400).
+func ReadPolicyFile(path string) ([]byte, error) {
+	return readPolicyFile(path)
+}
+
+// fileDigest streams path into a SHA-256 hash, rejecting non-regular files and
+// files exceeding maxPolicyFileBytes without buffering the full contents into memory.
+func fileDigest(path string) (string, error) {
+	file, err := openPolicyFile(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err == nil && info.Size() > maxPolicyFileBytes {
+		return "", fmt.Errorf("%w: %q exceeds the %d byte limit", ErrPolicyTooLarge, path, maxPolicyFileBytes)
+	}
+
+	hasher := sha256.New()
+	n, err := io.Copy(hasher, io.LimitReader(file, maxPolicyFileBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if n > maxPolicyFileBytes {
+		return "", fmt.Errorf("%w: %q exceeds the %d byte limit", ErrPolicyTooLarge, path, maxPolicyFileBytes)
+	}
+
+	return fmt.Sprintf("sha256:%x", hasher.Sum(nil)), nil
+}
+
+var (
+	_ IPolicyGetter         = &LoadPolicy{}
+	_ IExceptionsGetter     = &LoadPolicy{}
+	_ IAttackTracksGetter   = &LoadPolicy{}
+	_ IControlsInputsGetter = &LoadPolicy{}
+)
+
+func getCacheDir() string {
+	defaultDirPath := ".kubescape"
+	if homeDir, err := os.UserHomeDir(); err == nil {
+		defaultDirPath = filepath.Join(homeDir, defaultDirPath)
+	}
+	return defaultDirPath
+}
+
+// LoadPolicy loads policies from a local repository.
+type LoadPolicy struct {
+	filePaths       []string
+	consumedInputMu sync.Mutex
+	consumedPath    string
+	consumedDigest  string
+}
+
+// NewLoadPolicy builds a LoadPolicy.
+func NewLoadPolicy(filePaths []string) *LoadPolicy {
+	return &LoadPolicy{
+		filePaths: filePaths,
+	}
+}
+
+// ShouldPersistPolicyArtifacts prevents explicit local inputs from being
+// republished into Kubescape's shared disk fallback.
+func (lp *LoadPolicy) ShouldPersistPolicyArtifacts() bool {
+	return false
+}
+
+// GetControl returns a control from the policy file. The control is named by
+// its control ID or, when it carries one, its framework section number; see
+// controlMatcher.
+//
+// A file that cannot be read or decoded is skipped, so a partly damaged cache
+// still answers for the controls in its other files. If no file is usable the
+// catalog is unavailable, and that is reported as ErrCatalogUnavailable
+// rather than as an unknown control.
+func (lp *LoadPolicy) GetControl(controlID string) (*reporthandling.Control, error) {
+	if strings.TrimSpace(controlID) == "" {
+		return nil, ErrIDRequired
+	}
+	matcher := newControlMatcher(controlID)
+	usable := false        // some file held a control or a framework with controls
+	var firstFailure error // why the first unusable file was skipped
+
+	for _, filePath := range lp.filePaths {
+		buf, err := readPolicyFile(filePath)
+		if err != nil {
+			if firstFailure == nil {
+				firstFailure = err
+			}
+			continue
+		}
+
+		// check if the file is a control descriptor: a ControlID field is populated.
+		var control reporthandling.Control
+		if err = json.Unmarshal(buf, &control); err == nil && control.ControlID != "" {
+			usable = true
+			if matcher.offer(&control) {
+				return &control, nil
+			}
+			continue
+		}
+
+		// check if the file is a framework descriptor
+		var framework reporthandling.Framework
+		if err = json.Unmarshal(buf, &framework); err == nil && len(framework.Controls) > 0 {
+			usable = true
+			for _, toPin := range framework.Controls {
+				ctrl := toPin
+				if matcher.offer(&ctrl) {
+					return &ctrl, nil
+				}
+			}
+		} else if firstFailure == nil {
+			firstFailure = fmt.Errorf("%s: not a control or a framework with controls", filepath.Base(filePath))
+			if err != nil {
+				firstFailure = fmt.Errorf("%s: %w", filepath.Base(filePath), err)
+			}
+		}
+	}
+
+	if !usable {
+		if firstFailure == nil {
+			firstFailure = errors.New("no policy files")
+		}
+		return nil, fmt.Errorf("controlID: %s: %w: %w", controlID, ErrCatalogUnavailable, firstFailure)
+	}
+
+	control, err := matcher.bySection()
+	if err != nil {
+		return nil, err
+	}
+	if control != nil {
+		return control, nil
+	}
+	return nil, &controlNotFoundError{cause: fmt.Errorf("controlID: %s: %w", controlID, ErrControlNotMatching)}
+}
+
+// GetFramework retrieves a framework configuration from the policy paths.
+func (lp *LoadPolicy) GetFramework(frameworkName string) (*reporthandling.Framework, error) {
+	if frameworkName == "" {
+		return nil, ErrNameRequired
+	}
+
+	for _, filePath := range lp.filePaths {
+		buf, err := readPolicyFile(filePath)
+		if err != nil {
+			logger.L().Debug("skipping unreadable policy file", helpers.String("path", filePath), helpers.Error(err))
+			continue
+		}
+
+		var framework reporthandling.Framework
+		if err = json.Unmarshal(buf, &framework); err != nil {
+			logger.L().Debug("skipping unparsable policy file", helpers.String("path", filePath), helpers.Error(err))
+			continue
+		}
+
+		if strings.EqualFold(frameworkName, framework.Name) {
+			return &framework, nil
+		}
+	}
+
+	return nil, fmt.Errorf("framework: %s: %w", frameworkName, ErrFrameworkNotMatching)
+}
+
+// GetFrameworks returns all configured framework descriptors.
+func (lp *LoadPolicy) GetFrameworks() ([]reporthandling.Framework, error) {
+	frameworks := make([]reporthandling.Framework, 0, 10)
+	seenFws := make(map[string]struct{})
+
+	for _, f := range lp.filePaths {
+		buf, err := readPolicyFile(f)
+		if err != nil {
+			logger.L().Debug("skipping unreadable policy file", helpers.String("path", f), helpers.Error(err))
+			continue
+		}
+
+		var framework reporthandling.Framework
+		if err = json.Unmarshal(buf, &framework); err != nil {
+			// ignore invalid framework files
+			continue
+		}
+
+		// dedupe
+		_, alreadyLoaded := seenFws[framework.Name]
+		if alreadyLoaded {
+			continue
+		}
+
+		seenFws[framework.Name] = struct{}{}
+		frameworks = append(frameworks, framework)
+	}
+
+	return frameworks, nil
+}
+
+// ListFrameworks lists the names of all configured frameworks in this policy.
+func (lp *LoadPolicy) ListFrameworks() ([]string, error) {
+	frameworkNames := make([]string, 0, 10)
+
+	for _, f := range lp.filePaths {
+		buf, err := readPolicyFile(f)
+		if err != nil {
+			logger.L().Debug("skipping unreadable policy file", helpers.String("path", f), helpers.Error(err))
+			continue
+		}
+
+		var framework reporthandling.Framework
+		if err := json.Unmarshal(buf, &framework); err != nil {
+			continue
+		}
+
+		if framework.Name == "" || contains(frameworkNames, framework.Name) {
+			continue
+		}
+
+		frameworkNames = append(frameworkNames, framework.Name)
+	}
+
+	return frameworkNames, nil
+}
+
+// ListControls returns the list of controls in the format "id|name|frameworks".
+func (lp *LoadPolicy) ListControls() ([]string, error) {
+	type controlInfo struct {
+		id         string
+		name       string
+		frameworks []string
+	}
+
+	controlsMap := make(map[string]*controlInfo)
+	var orderedIDs []string
+
+	for _, filePath := range lp.filePaths {
+		buf, err := readPolicyFile(filePath)
+		if err != nil {
+			continue
+		}
+
+		// check if the file is a control descriptor: a ControlID field is populated.
+		var control reporthandling.Control
+		if err = json.Unmarshal(buf, &control); err == nil && control.ControlID != "" {
+			info, exists := controlsMap[control.ControlID]
+			if !exists {
+				info = &controlInfo{id: control.ControlID}
+				controlsMap[control.ControlID] = info
+				orderedIDs = append(orderedIDs, control.ControlID)
+			}
+			if info.name == "" {
+				info.name = control.Name
+			}
+			continue
+		}
+
+		// check if the file is a framework descriptor
+		var framework reporthandling.Framework
+		if err = json.Unmarshal(buf, &framework); err == nil && framework.Name != "" {
+			isAllControls := strings.EqualFold(framework.Name, "allcontrols")
+			for _, ctrl := range framework.Controls {
+				info, exists := controlsMap[ctrl.ControlID]
+				if !exists {
+					info = &controlInfo{id: ctrl.ControlID}
+					controlsMap[ctrl.ControlID] = info
+					orderedIDs = append(orderedIDs, ctrl.ControlID)
+				}
+				if info.name == "" {
+					info.name = ctrl.Name
+				}
+				if !isAllControls {
+					found := false
+					for _, fw := range info.frameworks {
+						if strings.EqualFold(fw, framework.Name) {
+							found = true
+							break
+						}
+					}
+					if !found {
+						info.frameworks = append(info.frameworks, framework.Name)
+					}
+				}
+			}
+		}
+	}
+
+	results := make([]string, 0, len(orderedIDs))
+	for _, id := range orderedIDs {
+		info := controlsMap[id]
+		sort.Strings(info.frameworks)
+		entry := fmt.Sprintf("%s|%s|%s", info.id, info.name, strings.Join(info.frameworks, ", "))
+		results = append(results, entry)
+	}
+
+	return results, nil
+}
+
+// GetExceptions retrieves configured exceptions.
+//
+// NOTE: the cluster parameter is not used at this moment.
+func (lp *LoadPolicy) GetExceptions(_ context.Context, _ /* clusterName */ string) ([]armotypes.PostureExceptionPolicy, error) {
+	// NOTE: this assumes that the first path contains a valid exceptions descriptor
+	filePath := lp.filePath()
+
+	buf, err := readPolicyFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	exception := make([]armotypes.PostureExceptionPolicy, 0, 300)
+	err = json.Unmarshal(buf, &exception)
+	if err == nil {
+		lp.recordConsumedFile(filePath, buf)
+	}
+
+	return exception, err
+}
+
+// GetControlsInputs retrieves the map of control configs.
+//
+// NOTE: the cluster parameter is not used at this moment.
+func (lp *LoadPolicy) GetControlsInputs(_ context.Context, _ /* clusterName */ string) (map[string][]string, error) {
+	// NOTE: this assumes that only the first path contains a valid control inputs descriptor
+	filePath := lp.filePath()
+	fileName := filepath.Base(filePath)
+
+	buf, err := readPolicyFile(filePath)
+	if err != nil {
+		formattedError := fmt.Errorf(
+			`error opening %s file, "controls-config" will be downloaded from ARMO management portal`,
+			fileName,
+		)
+
+		return nil, formattedError
+	}
+
+	controlInputs, err := decodeControlsInputs(buf)
+	if err != nil {
+		formattedError := fmt.Errorf(
+			`error reading %s file, %v, "controls-config" will be downloaded from ARMO management portal`,
+			fileName, err,
+		)
+
+		return nil, formattedError
+	}
+	if len(controlInputs) > 0 {
+		lp.recordConsumedFile(filePath, buf)
+	}
+
+	return controlInputs, nil
+}
+
+// ReadControlsInputsFile reads and decodes the controls configuration file at
+// path under the rules GetControlsInputs applies: a regular file within the size
+// limit, holding a JSON object of control inputs. Unlike GetControlsInputs, whose
+// errors are worded for a scan that goes on with another source, it returns the
+// cause, for a caller that has to refuse an unusable file before it acts.
+func ReadControlsInputsFile(path string) (map[string][]string, error) {
+	buf, err := readPolicyFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return decodeControlsInputs(buf)
+}
+
+func decodeControlsInputs(buf []byte) (map[string][]string, error) {
+	controlInputs := make(map[string][]string, 100) // from armotypes.Settings.PostureControlInputs
+	if err := json.Unmarshal(buf, &controlInputs); err != nil {
+		return nil, err
+	}
+	return controlInputs, nil
+}
+
+// ConsumedFileDigest returns the digest of the exact local input bytes that
+// this getter successfully used. The path is kept internal until a caller
+// applies its own safe-reporting policy.
+func (lp *LoadPolicy) ConsumedFileDigest() (path, digest string, ok bool) {
+	lp.consumedInputMu.Lock()
+	defer lp.consumedInputMu.Unlock()
+	if lp.consumedDigest == "" {
+		return "", "", false
+	}
+	return lp.consumedPath, lp.consumedDigest, true
+}
+
+func (lp *LoadPolicy) recordConsumedFile(path string, contents []byte) {
+	digest := contentDigest(contents)
+	lp.consumedInputMu.Lock()
+	defer lp.consumedInputMu.Unlock()
+	lp.consumedPath = path
+	lp.consumedDigest = digest
+}
+
+func contentDigest(contents []byte) string {
+	return fmt.Sprintf("sha256:%x", sha256.Sum256(contents))
+}
+
+// GetAttackTracks yields the attack tracks from a config file.
+func (lp *LoadPolicy) GetAttackTracks() ([]v1alpha1.AttackTrack, error) {
+	attackTracks := make([]v1alpha1.AttackTrack, 0, 20)
+
+	buf, err := readPolicyFile(lp.filePath())
+	if err != nil {
+		return nil, err
+	}
+
+	if err = json.Unmarshal(buf, &attackTracks); err != nil {
+		return nil, err
+	}
+
+	return attackTracks, nil
+}
+
+// CacheSource identifies the contents of the file this getter reads, with
+// the same digest ConsumedFileDigest reports. Files with the same contents,
+// such as identical REST request bodies saved to different temporary paths,
+// share an identity; a file whose contents change gets a new one. A file that
+// cannot be read is identified by its path, and its failed load is never
+// cached. A nil getter is identified the same way as no getter at all.
+func (lp *LoadPolicy) CacheSource() string {
+	if lp == nil {
+		return CacheSourceOf(nil)
+	}
+	filePath := filepath.Clean(lp.filePath())
+	digest, err := fileDigest(filePath)
+	if err != nil {
+		return fmt.Sprintf("unreadable-file:%q", filePath)
+	}
+	return "file:" + digest
+}
+
+// LoadedCacheSource identifies the exact bytes the last successful
+// GetExceptions or GetControlsInputs consumed, in the form CacheSource uses.
+func (lp *LoadPolicy) LoadedCacheSource() (string, bool) {
+	if lp == nil {
+		return "", false
+	}
+	_, digest, ok := lp.ConsumedFileDigest()
+	if !ok {
+		return "", false
+	}
+	return "file:" + digest, true
+}
+
+// SourceFile returns the file this getter reads.
+func (lp *LoadPolicy) SourceFile() (string, bool) {
+	if lp == nil {
+		return "", false
+	}
+	filePath := lp.filePath()
+	return filePath, filePath != ""
+}
+
+// temporary support for a list of files
+func (lp *LoadPolicy) filePath() string {
+	if len(lp.filePaths) > 0 {
+		return lp.filePaths[0]
+	}
+	return ""
+}

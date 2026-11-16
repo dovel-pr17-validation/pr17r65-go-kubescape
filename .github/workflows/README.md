@@ -1,0 +1,69 @@
+# Kubescape workflows
+
+Tag terminology: `v<major>.<minor>.<patch>`
+
+## Developing process
+
+Kubescape's default branch is `master`; open every PR against `master`.
+
+### Opening a PR
+
+Opening a PR triggers `00-pr-scanner.yaml`, which calls the reusable `a-pr-scanner.yaml` workflow. That runs, in order: `go test -race ./...`; a second race-enabled run over `./core/cautils/...` with `CGO_ENABLED=1`; a GoReleaser snapshot build for the runner's own platform only (`build --clean --snapshot --single-target`); the `smoke_testing/init.py` smoke test against that binary; and `golangci-lint` in `only-new-issues` mode. In parallel, a Windows runner executes the Windows-tagged core test suite (`./core/core`, `./core/pkg/fixhandler`, and `./core/pkg/resourcehandler/partitionstore`) and the `TestFileWatcher` tests of `./core/pkg/watch`. Note that the Linux job is named "Create cross-platform build" — it is not one. The cross-platform build happens in `02-release.yaml`.
+
+Two GitHub Apps report alongside it: the DCO check, which requires a `Signed-off-by:` trailer on every commit, and GitGuardian secret scanning.
+
+`00-pr-scanner.yaml` runs on every PR, and its `changes` job decides whether the build and E2E jobs run, so a PR that touches nothing else skips them. A skipped job reports as passed, so required checks never wait on a docs-only PR. It ignores `**/*.md`, `**/*.yaml`, `**/*.yml` and `**/*.sh` at any depth, plus files sitting directly in `website/`, `examples/`, `docs/`, `build/` and `.github/`. Those last five are single-level patterns: a nested file such as `docs/guide/diagram.svg` does not match and will still run the build. The build is skipped only when *every* changed file in the PR matches one of the patterns.
+
+A PR that touches `core/pkg/rbacgraph/`, `go.mod` or `go.sum` also triggers `rbac-parity.yaml`. It downloads the `kube-apiserver` and `etcd` releases pinned in `core/pkg/rbacgraph/parity/reference.env`, verifies their checksums, and runs `go test -tags rbacparity ./core/pkg/rbacgraph/parity/...`, which checks the Kubernetes answer recorded in every RBAC parity fixture against that server. It uses a `paths` allow-list rather than a deny-list because the fixtures are YAML, which `00-pr-scanner.yaml` ignores. It needs no secrets, so it runs on PRs from forks, and it runs again on the push to `master`. See `core/pkg/rbacgraph/parity/README.md`.
+
+A weekly run of `k8scveindex-feed.yaml` checks that the embedded Kubernetes CVE feed's `updated_at` timestamp is not in the future or more than 30 days old. The same check runs on PRs that touch the CVE index package or its workflow, and reports the `go generate ./core/pkg/k8scveindex` command when the check fails. If the upstream timestamp is also more than 30 days old, regenerating will not make the check pass. This time-sensitive check is opt-in and does not fail the regular package tests.
+
+### Reviewing a PR
+
+The E2E system tests do not live in this repository. `00-pr-scanner.yaml` dispatches them to a private repository and polls for the result.
+
+They run automatically on every PR that changes code — there is no label to add and no approval gate. The `run-system-tests` job is gated only on the `changes` job finding a code change and the `wf-preparation` job finding the required organization secrets, which means it is **skipped on docs-only PRs and on PRs from forks**. If you are contributing from a fork, the unit tests and the smoke test are the only automated verification available to you, so cover your change with unit tests.
+
+### Approving a PR
+
+Once a maintainer approves and the required checks are green, the PR can be merged.
+
+### Merging a PR
+
+The code is merged, no other actions are needed.
+
+`00-pr-scanner.yaml` then runs again on the push to `master`, with the same paths in its `paths-ignore` filter, so the merge commit gets the same build, tests and lint the PR got. This matters because a PR run only proves the branch was green against the base *as it stood when that run started*: two PRs can each pass, merge, and still break `master` between them. Without the push run the failure first surfaces on the next contributor's PR, pointing at files they never touched.
+
+The E2E system tests do **not** run on merge — `run-system-tests` is gated on `github.event_name != 'push'`. Each push run gets a concurrency group of its own (`github.run_id`) and is never cancelled, so a burst of merges cannot cancel or replace another merge's run; pull request runs are still grouped by ref and superseded by the next push to the PR. `internal/ghworkflows/masterbuild_test.go` asserts all of this.
+
+
+## Release process
+
+Releases are cut from `master` when the maintainers decide to ship, not on a fixed schedule. A release normally bumps the `patch` version; breaking changes bump the `major` version instead.
+
+### Creating a new tag
+
+When the maintainers decide to release, a maintainer creates a tag.
+
+The tag should look as follows: `v<A>.<B>.<C>`. Pushing it triggers `02-release.yaml`, whose tag filter matches release tags only — a pre-release suffix such as `-rc.0` will not start a release.
+
+`02-release.yaml` then:
+
+1. Builds the cross-platform binaries and container images with GoReleaser.
+2. Runs the system tests against a Kind cluster and publishes a JUnit report.
+3. Signs the artifacts with Cosign and generates an SBOM with Syft.
+4. Attests the build provenance.
+5. Publishes the artifacts and the container images to `quay.io`.
+6. Opens the version bump against the krew index.
+
+The workflow can also be started manually via `workflow_dispatch`, which exposes a `skip_publish` input for dry runs.
+
+## Additional Information
+
+Reusable workflows — the ones invoked by another workflow through `on: workflow_call` — carry an alphabetic prefix (`a-pr-scanner.yaml`). A workflow that invokes one carries a numeric prefix (`00-pr-scanner.yaml`). `02-release.yaml` also carries a numeric prefix, but it invokes nothing: it is an event-triggered entrypoint that does its work inline. Workflows that are neither reusable nor callers, such as `scorecard.yml`, sit outside the convention.
+
+`osps-baseline.yml` is one of those standalone workflows. It runs the OSPS Baseline scanner against this repository on every push to `master`, weekly, and on manual dispatch, using the `osps-baseline-2026-08` catalog. Results appear in the run summary and in the `osps-baseline-results` artifact, kept for 30 days; nothing is published outside the repository. The Security Insights file at the repository root lists it under `repository.security.tools`.
+
+## Screenshot
+
+<img width="1469" alt="image" src="https://user-images.githubusercontent.com/64066841/212532727-e82ec9e7-263d-408b-b4b0-a8c943f0109a.png">

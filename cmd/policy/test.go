@@ -1,0 +1,269 @@
+package policy
+
+import (
+	"fmt"
+	"regexp"
+	"strings"
+
+	"github.com/jwalton/gchalk"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/pkg/policytest"
+	"github.com/spf13/cobra"
+)
+
+func getPolicyTestCmd() *cobra.Command {
+	var (
+		update      bool
+		run         string
+		junitReport string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "test <path>",
+		Short: "Run a Rego control's test fixtures and report pass/fail",
+		Long:  `Discovers rule directories (raw.rego + rule.metadata.json, with test cases under test/<case>/{input,expected.json} and an optional data.json of control inputs) under <path>, evaluates every case, and reports which ones match their expected.json.`,
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var pattern *regexp.Regexp
+			if run != "" {
+				var err error
+				if pattern, err = regexp.Compile(run); err != nil {
+					return fmt.Errorf("invalid --run pattern: %w", err)
+				}
+			}
+			if cmd.Flags().Changed("junit-report") {
+				if strings.TrimSpace(junitReport) == "" {
+					return fmt.Errorf("--junit-report requires a file path")
+				}
+				if update {
+					return fmt.Errorf("--junit-report cannot be used with --update: --update rewrites fixtures instead of testing them")
+				}
+			}
+			// The invocation is valid from this point on. A case that fails,
+			// or cannot be evaluated, is a test result and should not print
+			// command usage.
+			cmd.SilenceUsage = true
+			if update {
+				return runPolicyUpdate(cmd, args[0], pattern)
+			}
+			return runPolicyTest(cmd, args[0], pattern, junitReport)
+		},
+	}
+
+	cmd.Flags().BoolVar(&update, "update", false, "Rewrite each case's expected.json from the rule's current output instead of comparing against it")
+	cmd.Flags().StringVar(&run, "run", "", "Only run the cases whose <rule>/<case> name matches this regular expression")
+	cmd.Flags().StringVar(&junitReport, "junit-report", "", "Also write the results to this file as a JUnit XML report, for CI systems that display test results")
+
+	return cmd
+}
+
+func runPolicyUpdate(cmd *cobra.Command, path string, pattern *regexp.Regexp) error {
+	rules, err := discoverRules(path, pattern)
+	if err != nil {
+		return err
+	}
+
+	ctx := cmd.Context()
+	changed, failed := 0, 0
+	out := cmd.OutOrStdout()
+	colored := shouldColor(out)
+
+	for _, rule := range rules {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if len(rule.Cases) == 0 {
+			msg := fmt.Sprintf("%s: no test cases\n", rule.Name)
+			if colored {
+				msg = fmt.Sprintf("%s: %s\n", gchalk.WithBrightCyan().Bold(rule.Name), gchalk.BrightYellow("no test cases"))
+			}
+			if _, err := fmt.Fprint(out, msg); err != nil {
+				return fmt.Errorf("write policy test output: %w", err)
+			}
+			continue
+		}
+		for _, result := range policytest.UpdateRule(ctx, rule) {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			ruleCase := fmt.Sprintf("%s/%s", result.RuleName, result.CaseName)
+			switch {
+			case result.Err != nil:
+				failed++
+				badge := "ERROR"
+				if colored {
+					badge = gchalk.WithBrightRed().Bold("ERROR")
+					ruleCase = gchalk.WithBrightCyan().Bold(ruleCase)
+				}
+				if _, err := fmt.Fprintf(out, "%s %s: %v\n", badge, ruleCase, result.Err); err != nil {
+					return fmt.Errorf("write policy test output: %w", err)
+				}
+			case result.Changed:
+				changed++
+				badge := "UPDATED"
+				if colored {
+					badge = gchalk.WithBrightYellow().Bold("UPDATED")
+					ruleCase = gchalk.WithBrightCyan().Bold(ruleCase)
+				}
+				if _, err := fmt.Fprintf(out, "%s %s\n", badge, ruleCase); err != nil {
+					return fmt.Errorf("write policy test output: %w", err)
+				}
+			default:
+				badge := "UNCHANGED"
+				if colored {
+					badge = gchalk.Bold("UNCHANGED")
+					ruleCase = gchalk.WithBrightCyan().Bold(ruleCase)
+				}
+				if _, err := fmt.Fprintf(out, "%s %s\n", badge, ruleCase); err != nil {
+					return fmt.Errorf("write policy test output: %w", err)
+				}
+			}
+		}
+	}
+
+	if colored {
+		changedStr := gchalk.Bold(fmt.Sprintf("%d", changed))
+		if changed > 0 {
+			changedStr = gchalk.WithBrightYellow().Bold(fmt.Sprintf("%d", changed))
+		}
+		if _, err := fmt.Fprintf(out, "\n%s case(s) updated\n", changedStr); err != nil {
+			return fmt.Errorf("write policy test output: %w", err)
+		}
+	} else {
+		if _, err := fmt.Fprintf(out, "\n%d case(s) updated\n", changed); err != nil {
+			return fmt.Errorf("write policy test output: %w", err)
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d test case(s) could not be evaluated", failed)
+	}
+	return nil
+}
+
+// discoverRules finds the rules under path and, when pattern is set, narrows
+// them to the cases it selects.
+func discoverRules(path string, pattern *regexp.Regexp) ([]policytest.RuleUnderTest, error) {
+	rules, err := policytest.DiscoverPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("discover rules: %w", err)
+	}
+	if len(rules) == 0 {
+		return nil, fmt.Errorf("no rule directories (raw.rego + rule.metadata.json) found under %q", path)
+	}
+	if pattern == nil {
+		return rules, nil
+	}
+	rules = policytest.FilterCases(rules, pattern)
+	if len(rules) == 0 {
+		// Report it rather than printing 0/0 cases passed, so a mistyped
+		// pattern cannot turn a CI run into a silent success.
+		return nil, fmt.Errorf("no test cases under %q match --run %q", path, pattern.String())
+	}
+	return rules, nil
+}
+
+func runPolicyTest(cmd *cobra.Command, path string, pattern *regexp.Regexp, junitReport string) error {
+	rules, err := discoverRules(path, pattern)
+	if err != nil {
+		return err
+	}
+
+	ctx := cmd.Context()
+	total, failed := 0, 0
+	out := cmd.OutOrStdout()
+	colored := shouldColor(out)
+	var results []policytest.CaseResult
+
+	for _, rule := range rules {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if len(rule.Cases) == 0 {
+			msg := fmt.Sprintf("%s: no test cases\n", rule.Name)
+			if colored {
+				msg = fmt.Sprintf("%s: %s\n", gchalk.WithBrightCyan().Bold(rule.Name), gchalk.BrightYellow("no test cases"))
+			}
+			if _, err := fmt.Fprint(out, msg); err != nil {
+				return fmt.Errorf("write policy test output: %w", err)
+			}
+			continue
+		}
+		for _, result := range policytest.RunRule(ctx, rule) {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			total++
+			results = append(results, result)
+			ruleCase := fmt.Sprintf("%s/%s", result.RuleName, result.CaseName)
+			switch {
+			case result.Err != nil:
+				failed++
+				badge := "FAIL"
+				if colored {
+					badge = gchalk.WithBrightRed().Bold("FAIL")
+					ruleCase = gchalk.WithBrightCyan().Bold(ruleCase)
+				}
+				if _, err := fmt.Fprintf(out, "%s %s: %v\n", badge, ruleCase, result.Err); err != nil {
+					return fmt.Errorf("write policy test output: %w", err)
+				}
+			case !result.Passed:
+				failed++
+				badge := "FAIL"
+				if colored {
+					badge = gchalk.WithBrightRed().Bold("FAIL")
+					ruleCase = gchalk.WithBrightCyan().Bold(ruleCase)
+				}
+				if _, err := fmt.Fprintf(out, "%s %s\n%s\n", badge, ruleCase, result.Diff); err != nil {
+					return fmt.Errorf("write policy test output: %w", err)
+				}
+			default:
+				badge := "PASS"
+				if colored {
+					badge = gchalk.WithBrightGreen().Bold("PASS")
+					ruleCase = gchalk.WithBrightCyan().Bold(ruleCase)
+				}
+				if _, err := fmt.Fprintf(out, "%s %s\n", badge, ruleCase); err != nil {
+					return fmt.Errorf("write policy test output: %w", err)
+				}
+			}
+		}
+	}
+
+	passedCount := total - failed
+	if colored {
+		passedStr := gchalk.WithBrightGreen().Bold(fmt.Sprintf("%d", passedCount))
+		if passedCount == 0 && total > 0 {
+			passedStr = gchalk.WithBrightRed().Bold(fmt.Sprintf("%d", passedCount))
+		}
+		totalStr := gchalk.Bold(fmt.Sprintf("%d", total))
+		if _, err := fmt.Fprintf(out, "\n%s/%s cases passed\n", passedStr, totalStr); err != nil {
+			return fmt.Errorf("write policy test output: %w", err)
+		}
+	} else {
+		if _, err := fmt.Fprintf(out, "\n%d/%d cases passed\n", passedCount, total); err != nil {
+			return fmt.Errorf("write policy test output: %w", err)
+		}
+	}
+	// The report is written whether or not every case passed: a CI system
+	// reads it to show which cases failed.
+	if junitReport != "" {
+		if err := writeJUnitReport(junitReport, results); err != nil {
+			return err
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d test case(s) failed", failed)
+	}
+	return nil
+}
+
+func writeJUnitReport(path string, results []policytest.CaseResult) error {
+	report, err := policytest.JUnitReport(results)
+	if err != nil {
+		return fmt.Errorf("write JUnit report: %w", err)
+	}
+	if err := cautils.WriteFileAtomically(path, report, 0o600); err != nil {
+		return fmt.Errorf("write JUnit report: %w", err)
+	}
+	return nil
+}

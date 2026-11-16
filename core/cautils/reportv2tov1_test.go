@@ -1,0 +1,729 @@
+package cautils
+
+import (
+	"encoding/json"
+	"testing"
+	"time"
+
+	"github.com/armosec/armoapi-go/armotypes"
+	"github.com/kubescape/k8s-interface/workloadinterface"
+	"github.com/kubescape/opa-utils/reporthandling"
+	"github.com/kubescape/opa-utils/reporthandling/apis"
+	helpersv1 "github.com/kubescape/opa-utils/reporthandling/helpers/v1"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/reportsummary"
+	"github.com/kubescape/opa-utils/reporthandling/results/v1/resourcesresults"
+	reporthandlingv2 "github.com/kubescape/opa-utils/reporthandling/v2"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/version"
+)
+
+func TestReportV2ToV1(t *testing.T) {
+	tests := []struct {
+		name                string
+		session             *OPASessionObj
+		wantFrameworkNames  []string
+		wantFrameworkScores []float32
+	}{
+		{
+			name: "summary controls without frameworks create default framework",
+			session: &OPASessionObj{
+				Report: &reporthandlingv2.PostureReport{
+					SummaryDetails: reportsummary.SummaryDetails{
+						Score: 77,
+						Controls: reportsummary.ControlSummaries{
+							"C-001": reportsummary.ControlSummary{
+								ControlID:   "C-001",
+								Name:        "control one",
+								Score:       88,
+								ScoreFactor: 5,
+								Description: "description",
+								Remediation: "remediation",
+							},
+						},
+					},
+				},
+			},
+			wantFrameworkNames:  []string{""},
+			wantFrameworkScores: []float32{77},
+		},
+		{
+			name: "framework summaries preserve names and scores",
+			session: &OPASessionObj{
+				Report: &reporthandlingv2.PostureReport{
+					SummaryDetails: reportsummary.SummaryDetails{
+						Frameworks: []reportsummary.FrameworkSummary{
+							{Name: "NSA", Score: 90},
+							{Name: "MITRE", Score: 55},
+						},
+					},
+				},
+			},
+			wantFrameworkNames:  []string{"NSA", "MITRE"},
+			wantFrameworkScores: []float32{90, 55},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ReportV2ToV1(tt.session)
+
+			require.NotNil(t, got)
+			require.Len(t, got.FrameworkReports, len(tt.wantFrameworkNames))
+			for i := range tt.wantFrameworkNames {
+				assert.Equal(t, tt.wantFrameworkNames[i], got.FrameworkReports[i].Name)
+				assert.Equal(t, tt.wantFrameworkScores[i], got.FrameworkReports[i].Score)
+			}
+		})
+	}
+}
+
+func TestReportV2ToV1_DoesNotMutateAllResources(t *testing.T) {
+	resourceID := "apps/v1/ns/Deployment/demo"
+	controlID := "C-001"
+
+	controlSummary := reportsummary.ControlSummary{ControlID: controlID, Name: "control demo", ScoreFactor: 5}
+	controlSummary.Append(helpersv1.NewStatus(apis.StatusFailed), resourceID)
+
+	session := &OPASessionObj{
+		AllResources: map[string]workloadinterface.IMetadata{
+			resourceID: workloadinterface.NewWorkloadObj(map[string]any{
+				"apiVersion": "apps/v1",
+				"kind":       "Deployment",
+				"metadata":   map[string]any{"name": "demo", "namespace": "ns"},
+				"spec":       map[string]any{"replicas": float64(2)},
+			}),
+		},
+		ResourcesResult: map[string]resourcesresults.Result{
+			resourceID: {
+				ResourceID: resourceID,
+				AssociatedControls: []resourcesresults.ResourceAssociatedControl{
+					{
+						ControlID: controlID,
+						ResourceAssociatedRules: []resourcesresults.ResourceAssociatedRule{
+							{
+								Name:   "rule-demo",
+								Status: apis.StatusFailed,
+								Paths: []armotypes.PosturePaths{
+									{FailedPath: "spec.replicas", FixPath: armotypes.FixPath{Path: "spec.replicas", Value: "3"}},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Report: &reporthandlingv2.PostureReport{
+			SummaryDetails: reportsummary.SummaryDetails{
+				Controls: reportsummary.ControlSummaries{controlID: controlSummary},
+			},
+		},
+	}
+
+	got := ReportV2ToV1(session)
+
+	// The conversion must not mutate the caller's shared resource.
+	assert.Contains(t, session.AllResources[resourceID].GetObject(), "spec")
+
+	// The v1 alert object must still be trimmed, proving the failed-rule branch ran.
+	require.Len(t, got.FrameworkReports, 1)
+	require.Len(t, got.FrameworkReports[0].ControlReports, 1)
+	require.Len(t, got.FrameworkReports[0].ControlReports[0].RuleReports, 1)
+	alertObjects := got.FrameworkReports[0].ControlReports[0].RuleReports[0].RuleResponses[0].AlertObject.K8SApiObjects
+	require.Len(t, alertObjects, 1)
+	assert.NotContains(t, alertObjects[0], "spec")
+}
+
+// The OPA processor records a rule's paths as DeletePath / ReviewPath /
+// FixCommand entries and no longer sets FailedPath (#3598); the v1 rule
+// response has to carry them or every v1 finding loses its location.
+func TestReportV2ToV1_MapsDeleteReviewPathsAndFixCommand(t *testing.T) {
+	resourceID := "/v1/default/Pod/demo"
+	controlID := "C-0038"
+
+	controlSummary := reportsummary.ControlSummary{ControlID: controlID, Name: "host pid", ScoreFactor: 7}
+	controlSummary.Append(helpersv1.NewStatus(apis.StatusFailed), resourceID)
+
+	session := &OPASessionObj{
+		AllResources: map[string]workloadinterface.IMetadata{
+			resourceID: workloadinterface.NewWorkloadObj(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"metadata":   map[string]any{"name": "demo", "namespace": "default"},
+			}),
+		},
+		ResourcesResult: map[string]resourcesresults.Result{
+			resourceID: {
+				ResourceID: resourceID,
+				AssociatedControls: []resourcesresults.ResourceAssociatedControl{
+					{
+						ControlID: controlID,
+						ResourceAssociatedRules: []resourcesresults.ResourceAssociatedRule{
+							{
+								Name:   "host-pid-ipc-privileges",
+								Status: apis.StatusFailed,
+								Paths: []armotypes.PosturePaths{
+									{ResourceID: resourceID, DeletePath: "spec.hostPID"},
+									{ResourceID: resourceID, ReviewPath: "spec.containers[0].image"},
+									{ResourceID: resourceID, FixPath: armotypes.FixPath{Path: "spec.hostIPC", Value: "false"}},
+									{ResourceID: resourceID, FixCommand: "kubectl delete pod demo"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Report: &reporthandlingv2.PostureReport{
+			SummaryDetails: reportsummary.SummaryDetails{
+				Controls: reportsummary.ControlSummaries{controlID: controlSummary},
+			},
+		},
+	}
+
+	got := ReportV2ToV1(session)
+
+	require.Len(t, got.FrameworkReports, 1)
+	require.Len(t, got.FrameworkReports[0].ControlReports, 1)
+	require.Len(t, got.FrameworkReports[0].ControlReports[0].RuleReports, 1)
+	require.Len(t, got.FrameworkReports[0].ControlReports[0].RuleReports[0].RuleResponses, 1)
+	response := got.FrameworkReports[0].ControlReports[0].RuleReports[0].RuleResponses[0]
+	assert.Equal(t, []string{"spec.hostPID"}, response.DeletePaths)
+	assert.Equal(t, []string{"spec.containers[0].image"}, response.ReviewPaths)
+	assert.Equal(t, []armotypes.FixPath{{Path: "spec.hostIPC", Value: "false"}}, response.FixPaths)
+	assert.Equal(t, "kubectl delete pod demo", response.FixCommand)
+}
+
+// A rule's paths can belong to a related resource: the processor records a
+// RelatedObject's paths under that object's ResourceID (exposure-to-internet
+// reports the exposing Service's spec.type against the failed Pod). The v1
+// response must keep them on that related object, not move them onto the Pod.
+func TestReportV2ToV1_KeepsRelatedResourcePathsOnRelatedObject(t *testing.T) {
+	podID := "/v1/default/Pod/demo"
+	serviceID := "/v1/default/Service/demo-svc"
+	controlID := "C-0256"
+
+	controlSummary := reportsummary.ControlSummary{ControlID: controlID, Name: "exposure to internet", ScoreFactor: 7}
+	controlSummary.Append(helpersv1.NewStatus(apis.StatusFailed), podID)
+
+	session := &OPASessionObj{
+		AllResources: map[string]workloadinterface.IMetadata{
+			podID: workloadinterface.NewWorkloadObj(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"metadata":   map[string]any{"name": "demo", "namespace": "default"},
+				"spec":       map[string]any{"hostPID": true},
+			}),
+			serviceID: workloadinterface.NewWorkloadObj(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Service",
+				"metadata":   map[string]any{"name": "demo-svc", "namespace": "default"},
+				"spec":       map[string]any{"type": "LoadBalancer"},
+			}),
+		},
+		ResourcesResult: map[string]resourcesresults.Result{
+			podID: {
+				ResourceID: podID,
+				AssociatedControls: []resourcesresults.ResourceAssociatedControl{
+					{
+						ControlID: controlID,
+						ResourceAssociatedRules: []resourcesresults.ResourceAssociatedRule{
+							{
+								Name:                "exposure-to-internet",
+								Status:              apis.StatusFailed,
+								RelatedResourcesIDs: []string{serviceID},
+								Paths: []armotypes.PosturePaths{
+									{ResourceID: podID, DeletePath: "spec.hostPID"},
+									{ResourceID: podID, FixCommand: "kubectl label pod demo exposed=false"},
+									{ResourceID: serviceID, ReviewPath: "spec.type"},
+									{ResourceID: serviceID, DeletePath: "spec.externalIPs"},
+									{ResourceID: serviceID, FixCommand: "kubectl patch svc demo-svc -p '{\"spec\":{\"type\":\"ClusterIP\"}}'"},
+									{ResourceID: serviceID, FixCommand: "kubectl annotate svc demo-svc reviewed=true"},
+									{ResourceID: serviceID, FixCommand: "kubectl annotate svc demo-svc reviewed=true"},
+									// legacy data without a ResourceID describes the failed resource
+									{FailedPath: "spec.hostNetwork"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Report: &reporthandlingv2.PostureReport{
+			SummaryDetails: reportsummary.SummaryDetails{
+				Controls: reportsummary.ControlSummaries{controlID: controlSummary},
+			},
+		},
+	}
+
+	got := ReportV2ToV1(session)
+
+	require.Len(t, got.FrameworkReports, 1)
+	require.Len(t, got.FrameworkReports[0].ControlReports, 1)
+	require.Len(t, got.FrameworkReports[0].ControlReports[0].RuleReports, 1)
+	require.Len(t, got.FrameworkReports[0].ControlReports[0].RuleReports[0].RuleResponses, 1)
+	response := got.FrameworkReports[0].ControlReports[0].RuleReports[0].RuleResponses[0]
+
+	// the Pod keeps only its own remediation
+	assert.Equal(t, []string{"spec.hostPID"}, response.DeletePaths)
+	assert.Nil(t, response.ReviewPaths, "the Service's spec.type must not be reported against the Pod")
+	assert.Equal(t, []string{"spec.hostNetwork"}, response.FailedPaths)
+	assert.Equal(t, "kubectl label pod demo exposed=false", response.FixCommand)
+	require.Len(t, response.AlertObject.K8SApiObjects, 1)
+	assert.Equal(t, "Pod", response.AlertObject.K8SApiObjects[0]["kind"])
+
+	// the Service's remediation stays attached to the Service
+	require.Len(t, response.RelatedObjects, 1)
+	related := response.RelatedObjects[0]
+	assert.Equal(t, "Service", related.Object["kind"])
+	assert.Equal(t, map[string]any{"name": "demo-svc", "namespace": "default"}, related.Object["metadata"])
+	assert.Equal(t, []string{"spec.type"}, related.ReviewPaths)
+	assert.Equal(t, []string{"spec.externalIPs"}, related.DeletePaths)
+	assert.Equal(t, "kubectl patch svc demo-svc -p '{\"spec\":{\"type\":\"ClusterIP\"}}'\nkubectl annotate svc demo-svc reviewed=true", related.FixCommand)
+}
+
+func TestReportV2ToV1_StatusCounters(t *testing.T) {
+	controlID := "C-001"
+	controlSummary := reportsummary.ControlSummary{
+		ControlID:   controlID,
+		Name:        "control demo",
+		ScoreFactor: 5,
+		StatusCounters: reportsummary.StatusCounters{
+			PassedResources:   1,
+			FailedResources:   2,
+			SkippedResources:  3,
+			ExcludedResources: 4,
+		},
+	}
+
+	session := &OPASessionObj{
+		Report: &reporthandlingv2.PostureReport{
+			SummaryDetails: reportsummary.SummaryDetails{
+				Controls: reportsummary.ControlSummaries{controlID: controlSummary},
+			},
+		},
+	}
+
+	got := ReportV2ToV1(session)
+
+	require.Len(t, got.FrameworkReports, 1)
+	require.Len(t, got.FrameworkReports[0].ControlReports, 1)
+
+	cr := got.FrameworkReports[0].ControlReports[0]
+	assert.Equal(t, 10, cr.TotalResources)
+	assert.Equal(t, 2, cr.FailedResources)
+	assert.Equal(t, 7, cr.WarningResources)
+
+	assert.Equal(t, 10, got.FrameworkReports[0].TotalResources)
+	assert.Equal(t, 2, got.FrameworkReports[0].FailedResources)
+	assert.Equal(t, 7, got.FrameworkReports[0].WarningResources)
+}
+
+func TestReportV2ToV1_DuplicateFrameworkNames(t *testing.T) {
+	session := &OPASessionObj{
+		Report: &reporthandlingv2.PostureReport{
+			SummaryDetails: reportsummary.SummaryDetails{
+				Frameworks: []reportsummary.FrameworkSummary{
+					{
+						Name: "custom-rules",
+						Controls: reportsummary.ControlSummaries{
+							"C-001": reportsummary.ControlSummary{
+								ControlID: "C-001",
+								StatusCounters: reportsummary.StatusCounters{
+									PassedResources: 1,
+									FailedResources: 1,
+								},
+							},
+						},
+					},
+					{
+						Name: "custom-rules",
+						Controls: reportsummary.ControlSummaries{
+							"C-002": reportsummary.ControlSummary{
+								ControlID: "C-002",
+								StatusCounters: reportsummary.StatusCounters{
+									SkippedResources:  1,
+									ExcludedResources: 1,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	got := ReportV2ToV1(session)
+
+	require.Len(t, got.FrameworkReports, 2)
+	assert.Equal(t, "custom-rules", got.FrameworkReports[0].Name)
+	assert.Equal(t, "custom-rules", got.FrameworkReports[1].Name)
+
+	require.Len(t, got.FrameworkReports[0].ControlReports, 1)
+	assert.Equal(t, "C-001", got.FrameworkReports[0].ControlReports[0].ControlID)
+	assert.Equal(t, 2, got.FrameworkReports[0].ControlReports[0].TotalResources)
+
+	require.Len(t, got.FrameworkReports[1].ControlReports, 1)
+	cr2 := got.FrameworkReports[1].ControlReports[0]
+	assert.Equal(t, "C-002", cr2.ControlID)
+	assert.Equal(t, 2, cr2.TotalResources)
+	assert.Equal(t, 2, cr2.WarningResources)
+
+	assert.Equal(t, 2, got.FrameworkReports[0].TotalResources)
+	assert.Equal(t, 1, got.FrameworkReports[0].FailedResources)
+	assert.Equal(t, 2, got.FrameworkReports[1].TotalResources)
+	assert.Equal(t, 2, got.FrameworkReports[1].WarningResources)
+}
+
+func TestReportV2ToV1_Metadata(t *testing.T) {
+	now := time.Now().UTC()
+	apiServerInfo := &version.Info{GitVersion: "v1.30.0", Platform: "linux/amd64"}
+	resources := []reporthandling.Resource{
+		{
+			ResourceID: "apps/v1/default/Deployment/demo-app",
+		},
+	}
+	session := &OPASessionObj{
+		Report: &reporthandlingv2.PostureReport{
+			CustomerGUID:         "customer-123",
+			ClusterName:          "prod-cluster",
+			ClusterAPIServerInfo: apiServerInfo,
+			ClusterCloudProvider: "gke",
+			ReportID:             "report-456",
+			JobID:                "job-789",
+			ReportGenerationTime: now,
+			Resources:            resources,
+		},
+	}
+
+	got := ReportV2ToV1(session)
+
+	assert.Equal(t, "customer-123", got.CustomerGUID)
+	assert.Equal(t, "prod-cluster", got.ClusterName)
+	assert.Equal(t, apiServerInfo, got.ClusterAPIServerInfo)
+	assert.Equal(t, "gke", got.ClusterCloudProvider)
+	assert.Equal(t, "report-456", got.ReportID)
+	assert.Equal(t, "job-789", got.JobID)
+	assert.Equal(t, now, got.ReportGenerationTime)
+	assert.Equal(t, resources, got.Resources)
+}
+
+func TestReportV2ToV1_NilSafety(t *testing.T) {
+	gotNil := ReportV2ToV1(nil)
+	require.NotNil(t, gotNil)
+	assert.Empty(t, gotNil.FrameworkReports)
+
+	gotEmpty := ReportV2ToV1(&OPASessionObj{})
+	require.NotNil(t, gotEmpty)
+	assert.Empty(t, gotEmpty.FrameworkReports)
+}
+
+// The v1 report is a stable, cacheable artifact: ControlReports and
+// RuleReports were built by ranging over maps, so their order was reshuffled
+// on every run. Repeat the conversion enough times to exercise many map range
+// orders and require a sorted, reproducible sequence each time.
+func TestReportV2ToV1_DeterministicOrdering(t *testing.T) {
+	resourceID := "/v1/default/Pod/demo"
+	controlIDs := []string{"C-003", "C-001", "C-002"}
+	ruleNames := []string{"rule-zeta", "rule-alpha", "rule-mu"}
+
+	// Populate the maps in a deliberately unsorted order so a randomised range
+	// order would surface as an out-of-order result.
+	controls := reportsummary.ControlSummaries{}
+	associatedControls := []resourcesresults.ResourceAssociatedControl{}
+	for _, controlID := range controlIDs {
+		cs := reportsummary.ControlSummary{ControlID: controlID, Name: "control " + controlID, ScoreFactor: 5}
+		cs.Append(helpersv1.NewStatus(apis.StatusFailed), resourceID)
+		controls[controlID] = cs
+
+		rules := []resourcesresults.ResourceAssociatedRule{}
+		for _, ruleName := range ruleNames {
+			rules = append(rules, resourcesresults.ResourceAssociatedRule{
+				Name:   ruleName,
+				Status: apis.StatusFailed,
+				Paths: []armotypes.PosturePaths{
+					{ResourceID: resourceID, FixPath: armotypes.FixPath{Path: "spec.replicas", Value: "3"}},
+				},
+			})
+		}
+		associatedControls = append(associatedControls, resourcesresults.ResourceAssociatedControl{
+			ControlID:               controlID,
+			ResourceAssociatedRules: rules,
+		})
+	}
+
+	session := &OPASessionObj{
+		AllResources: map[string]workloadinterface.IMetadata{
+			resourceID: workloadinterface.NewWorkloadObj(map[string]any{
+				"apiVersion": "v1",
+				"kind":       "Pod",
+				"metadata":   map[string]any{"name": "demo", "namespace": "default"},
+			}),
+		},
+		ResourcesResult: map[string]resourcesresults.Result{
+			resourceID: {
+				ResourceID:         resourceID,
+				AssociatedControls: associatedControls,
+			},
+		},
+		Report: &reporthandlingv2.PostureReport{
+			SummaryDetails: reportsummary.SummaryDetails{
+				Controls: controls,
+			},
+		},
+	}
+
+	wantControlIDs := []string{"C-001", "C-002", "C-003"}
+	wantRuleNames := []string{"rule-alpha", "rule-mu", "rule-zeta"}
+
+	for i := 0; i < 50; i++ {
+		got := ReportV2ToV1(session)
+
+		require.Len(t, got.FrameworkReports, 1)
+		controlReports := got.FrameworkReports[0].ControlReports
+		require.Len(t, controlReports, len(controlIDs))
+
+		gotControlIDs := make([]string, 0, len(controlReports))
+		for _, cr := range controlReports {
+			gotControlIDs = append(gotControlIDs, cr.ControlID)
+		}
+		assert.Equal(t, wantControlIDs, gotControlIDs, "control reports must be emitted in sorted order")
+
+		for _, cr := range controlReports {
+			require.Len(t, cr.RuleReports, len(ruleNames))
+			gotRuleNames := make([]string, 0, len(cr.RuleReports))
+			for _, rr := range cr.RuleReports {
+				gotRuleNames = append(gotRuleNames, rr.Name)
+			}
+			assert.Equal(t, wantRuleNames, gotRuleNames, "rule reports must be emitted in sorted order")
+		}
+	}
+}
+
+func TestReportV2ToV1_FrameworkStatusCounters_MultipleControls(t *testing.T) {
+	// Framework counters aggregate unique resources across multiple controls
+	// and therefore differ from any individual control's counters.
+	session := &OPASessionObj{
+		Report: &reporthandlingv2.PostureReport{
+			SummaryDetails: reportsummary.SummaryDetails{
+				Frameworks: []reportsummary.FrameworkSummary{
+					{
+						Name: "cis-v1.23",
+						StatusCounters: reportsummary.StatusCounters{
+							PassedResources:   5,
+							FailedResources:   3,
+							SkippedResources:  2,
+							ExcludedResources: 1,
+						},
+						Controls: reportsummary.ControlSummaries{
+							"C-001": reportsummary.ControlSummary{
+								ControlID: "C-001",
+								StatusCounters: reportsummary.StatusCounters{
+									PassedResources: 3,
+									FailedResources: 1,
+								},
+							},
+							"C-002": reportsummary.ControlSummary{
+								ControlID: "C-002",
+								StatusCounters: reportsummary.StatusCounters{
+									PassedResources:   3,
+									FailedResources:   2,
+									SkippedResources:  2,
+									ExcludedResources: 1,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	got := ReportV2ToV1(session)
+
+	require.Len(t, got.FrameworkReports, 1)
+	fw := got.FrameworkReports[0]
+	assert.Equal(t, "cis-v1.23", fw.Name)
+
+	// Framework totals: Passed(5) + Failed(3) + Skipped(2) + Excluded(1) = 11
+	assert.Equal(t, 11, fw.TotalResources)
+	assert.Equal(t, 3, fw.FailedResources)
+	assert.Equal(t, 3, fw.WarningResources) // Skipped(2) + Excluded(1) = 3
+
+	// Controls have their own individual totals
+	require.Len(t, fw.ControlReports, 2)
+	for _, cr := range fw.ControlReports {
+		switch cr.ControlID {
+		case "C-001":
+			assert.Equal(t, 4, cr.TotalResources)
+			assert.Equal(t, 1, cr.FailedResources)
+		case "C-002":
+			assert.Equal(t, 8, cr.TotalResources)
+			assert.Equal(t, 2, cr.FailedResources)
+			assert.Equal(t, 3, cr.WarningResources)
+		}
+	}
+}
+
+// A combined NSA + MITRE scan with an exception scoped to NSA: each legacy
+// section is evaluated in its own framework, so the NSA section agrees with its
+// control summary (passed, no rule response) while the MITRE section keeps the
+// finding. A control only MITRE evaluates is absent from the NSA section.
+func TestReportV2ToV1_RuleStatusFollowsSectionFramework(t *testing.T) {
+	const (
+		resourceID   = "/v1/default/Pod/demo"
+		sharedCtl    = "C-0041"
+		mitreOnlyCtl = "C-0017"
+	)
+	nsaException := armotypes.PostureExceptionPolicy{
+		PortalBase:      armotypes.PortalBase{Name: "nsa-only"},
+		Actions:         []armotypes.PostureExceptionPolicyActions{armotypes.Disable},
+		PosturePolicies: []armotypes.PosturePolicy{{FrameworkName: "NSA", ControlID: sharedCtl}},
+	}
+	hostNetworkRule := resourcesresults.ResourceAssociatedRule{
+		Name:      "host-network-access",
+		Status:    apis.StatusFailed,
+		Paths:     []armotypes.PosturePaths{{ResourceID: resourceID, ReviewPath: "spec.hostNetwork"}},
+		Exception: []armotypes.PostureExceptionPolicy{nsaException},
+	}
+	mitreOnlyRule := resourcesresults.ResourceAssociatedRule{
+		Name:   "immutable-container-filesystem",
+		Status: apis.StatusFailed,
+		Paths:  []armotypes.PosturePaths{{ResourceID: resourceID, ReviewPath: "spec.containers[0].securityContext"}},
+	}
+
+	// the summary as the scan computes it: NSA excepts the finding, MITRE does not
+	nsaShared := reportsummary.ControlSummary{ControlID: sharedCtl, Name: "HostNetwork access"}
+	nsaShared.Append(&apis.StatusInfo{InnerStatus: apis.StatusPassed, SubStatus: apis.SubStatusException}, resourceID)
+	mitreShared := reportsummary.ControlSummary{ControlID: sharedCtl, Name: "HostNetwork access"}
+	mitreShared.Append(helpersv1.NewStatus(apis.StatusFailed), resourceID)
+	mitreOnly := reportsummary.ControlSummary{ControlID: mitreOnlyCtl, Name: "Immutable filesystem"}
+	mitreOnly.Append(helpersv1.NewStatus(apis.StatusFailed), resourceID)
+
+	session := &OPASessionObj{
+		AllResources: map[string]workloadinterface.IMetadata{
+			resourceID: workloadinterface.NewWorkloadObj(map[string]any{
+				"apiVersion": "v1", "kind": "Pod",
+				"metadata": map[string]any{"name": "demo", "namespace": "default"},
+				"spec":     map[string]any{"hostNetwork": true},
+			}),
+		},
+		ResourcesResult: map[string]resourcesresults.Result{
+			resourceID: {
+				ResourceID: resourceID,
+				AssociatedControls: []resourcesresults.ResourceAssociatedControl{
+					{ControlID: sharedCtl, Status: apis.StatusInfo{InnerStatus: apis.StatusFailed}, ResourceAssociatedRules: []resourcesresults.ResourceAssociatedRule{hostNetworkRule}},
+					{ControlID: mitreOnlyCtl, Status: apis.StatusInfo{InnerStatus: apis.StatusFailed}, ResourceAssociatedRules: []resourcesresults.ResourceAssociatedRule{mitreOnlyRule}},
+				},
+			},
+		},
+		Report: &reporthandlingv2.PostureReport{
+			SummaryDetails: reportsummary.SummaryDetails{
+				Frameworks: []reportsummary.FrameworkSummary{
+					{Name: "NSA", Controls: reportsummary.ControlSummaries{sharedCtl: nsaShared}},
+					{Name: "MITRE", Controls: reportsummary.ControlSummaries{sharedCtl: mitreShared, mitreOnlyCtl: mitreOnly}},
+				},
+			},
+		},
+	}
+
+	// assert the serialized report, as a consumer of the legacy format reads it
+	raw, err := json.Marshal(ReportV2ToV1(session))
+	require.NoError(t, err)
+	var got reporthandling.PostureReport
+	require.NoError(t, json.Unmarshal(raw, &got))
+	require.Len(t, got.FrameworkReports, 2)
+
+	byID := func(fw reporthandling.FrameworkReport, id string) (reporthandling.ControlReport, bool) {
+		for _, c := range fw.ControlReports {
+			if c.ControlID == id {
+				return c, true
+			}
+		}
+		return reporthandling.ControlReport{}, false
+	}
+
+	nsa, mitre := got.FrameworkReports[0], got.FrameworkReports[1]
+	require.Equal(t, "NSA", nsa.Name)
+
+	nsaControl, ok := byID(nsa, sharedCtl)
+	require.True(t, ok)
+	assert.Zero(t, nsaControl.FailedResources, "the NSA summary reports the control passed")
+	require.Len(t, nsaControl.RuleReports, 1)
+	assert.Empty(t, nsaControl.RuleReports[0].RuleResponses, "so the NSA section carries no failed rule response")
+	assert.Equal(t, "success", nsaControl.RuleReports[0].RuleStatus.Status)
+	_, ok = byID(nsa, mitreOnlyCtl)
+	assert.False(t, ok, "a control NSA does not evaluate stays out of its section")
+
+	mitreControl, ok := byID(mitre, sharedCtl)
+	require.True(t, ok)
+	assert.Equal(t, 1, mitreControl.FailedResources)
+	require.Len(t, mitreControl.RuleReports, 1)
+	require.Len(t, mitreControl.RuleReports[0].RuleResponses, 1, "the exception is not NSA's to give MITRE")
+	response := mitreControl.RuleReports[0].RuleResponses[0]
+	assert.Equal(t, string(apis.StatusFailed), response.RuleStatus)
+	assert.Equal(t, []string{"spec.hostNetwork"}, response.ReviewPaths)
+	assert.Nil(t, response.Exception, "an NSA-only exception does not apply to the MITRE response")
+
+	mitreOnlyControl, ok := byID(mitre, mitreOnlyCtl)
+	require.True(t, ok)
+	require.Len(t, mitreOnlyControl.RuleReports, 1)
+	assert.Len(t, mitreOnlyControl.RuleReports[0].RuleResponses, 1, "a rule without exceptions is unchanged")
+
+	// the evaluation held by the scan is not rewritten
+	rawRule := session.ResourcesResult[resourceID].AssociatedControls[0].ResourceAssociatedRules[0]
+	assert.Equal(t, apis.StatusFailed, rawRule.Status)
+	assert.Equal(t, []armotypes.PostureExceptionPolicy{nsaException}, rawRule.Exception)
+}
+
+func TestReportV2ToV1_FrameworkExceptionMetadata(t *testing.T) {
+	nsa := armotypes.PostureExceptionPolicy{
+		PortalBase:      armotypes.PortalBase{Name: "nsa-only"},
+		Actions:         []armotypes.PostureExceptionPolicyActions{armotypes.Disable},
+		PosturePolicies: []armotypes.PosturePolicy{{FrameworkName: "NSA", ControlID: "C-0034", RuleName: "R1"}},
+	}
+	mitre := armotypes.PostureExceptionPolicy{
+		PortalBase:      armotypes.PortalBase{Name: "mitre-alert"},
+		Actions:         []armotypes.PostureExceptionPolicyActions{armotypes.AlertOnly},
+		PosturePolicies: []armotypes.PosturePolicy{{FrameworkName: "MITRE", ControlID: "C-0034", RuleName: "R1"}},
+	}
+	for _, tt := range []struct {
+		name     string
+		policies []armotypes.PostureExceptionPolicy
+		want     *armotypes.PostureExceptionPolicy
+	}{
+		{name: "unselected exception", policies: []armotypes.PostureExceptionPolicy{nsa}},
+		{name: "applicable exception follows unselected", policies: []armotypes.PostureExceptionPolicy{nsa, mitre}, want: &mitre},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			control := reportsummary.ControlSummary{ControlID: "C-0034"}
+			control.Append(helpersv1.NewStatus(apis.StatusFailed), "resource")
+			session := &OPASessionObj{
+				Report: &reporthandlingv2.PostureReport{SummaryDetails: reportsummary.SummaryDetails{
+					Frameworks: []reportsummary.FrameworkSummary{{Name: "MITRE", Controls: reportsummary.ControlSummaries{"C-0034": control}}},
+				}},
+				ResourcesResult: map[string]resourcesresults.Result{"resource": {
+					ResourceID: "resource",
+					AssociatedControls: []resourcesresults.ResourceAssociatedControl{{
+						ControlID:               "C-0034",
+						ResourceAssociatedRules: []resourcesresults.ResourceAssociatedRule{{Name: "R1", Status: apis.StatusFailed, Exception: tt.policies}},
+					}},
+				}},
+			}
+			before, err := json.Marshal(session.ResourcesResult)
+			require.NoError(t, err)
+			report := ReportV2ToV1(session)
+			require.Len(t, report.FrameworkReports, 1)
+			require.Len(t, report.FrameworkReports[0].ControlReports, 1)
+			rules := report.FrameworkReports[0].ControlReports[0].RuleReports
+			require.Len(t, rules, 1)
+			require.Len(t, rules[0].RuleResponses, 1)
+			response := rules[0].RuleResponses[0]
+			assert.Equal(t, string(apis.StatusFailed), response.RuleStatus)
+			assert.Equal(t, tt.want, response.Exception)
+			after, err := json.Marshal(session.ResourcesResult)
+			require.NoError(t, err)
+			assert.JSONEq(t, string(before), string(after), "conversion must preserve raw exceptions and status")
+		})
+	}
+}

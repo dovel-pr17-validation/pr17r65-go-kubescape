@@ -1,0 +1,778 @@
+package core
+
+import (
+	"context"
+	"encoding/csv"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"sort"
+	"strings"
+
+	"github.com/jedib0t/go-pretty/v6/table"
+	"github.com/jedib0t/go-pretty/v6/text"
+	"github.com/jwalton/gchalk"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/cautils/getter"
+	metav1 "github.com/kubescape/kubescape/v4/core/meta/datastructures/v1"
+	"github.com/kubescape/kubescape/v4/core/pkg/resultshandling/printer/csvsafe"
+	"github.com/kubescape/kubescape/v4/core/pkg/resultshandling/printer/v2/prettyprinter/tableprinter/utils"
+	"github.com/kubescape/opa-utils/reporthandling"
+	"github.com/maruel/natural"
+	"sigs.k8s.io/yaml"
+)
+
+// listFunc handles targets whose output is a flat []string (frameworks, exceptions).
+// "controls" is handled separately via listControls because it produces typed structs.
+var listFunc = map[string]func(context.Context, *metav1.ListPolicies) ([]string, error){
+	"frameworks": listFrameworks,
+	"exceptions": listExceptions,
+}
+
+var listFormatFunc = map[string]func(context.Context, string, []string, ...io.Writer) error{
+	"pretty-print": prettyPrintListFormat,
+	"json":         jsonListFormat,
+	"yaml":         yamlListFormat,
+	"csv":          csvListFormat,
+}
+
+func ListSupportActions() []string {
+	commands := []string{"controls", "controls-config"}
+	for key := range listFunc {
+		commands = append(commands, key)
+	}
+
+	sort.Strings(commands)
+	return commands
+}
+
+// ListSupportFormats returns the formats supported by the list command.
+func ListSupportFormats() []string {
+	return []string{"pretty-print", "json", "yaml", "csv"}
+}
+
+func (ks *Kubescape) List(listPolicies *metav1.ListPolicies) (*metav1.ListResult, error) {
+	if listPolicies == nil {
+		return nil, errors.New("uninitialized list parameters")
+	}
+
+	if listPolicies.Target == "controls" {
+		entries, err := listControls(ks.Context(), listPolicies)
+		if err != nil {
+			return nil, err
+		}
+		entries = naturalSortControls(entries)
+		return &metav1.ListResult{Controls: entries}, nil
+	}
+
+	if listPolicies.Target == "controls-config" {
+		entries, err := listControlsConfig(ks.Context(), listPolicies)
+		if err != nil {
+			return nil, err
+		}
+		return &metav1.ListResult{ControlsConfig: entries}, nil
+	}
+
+	if policyListerFunc, ok := listFunc[listPolicies.Target]; ok {
+		policies, err := policyListerFunc(ks.Context(), listPolicies)
+		if err != nil {
+			return nil, err
+		}
+		policies = naturalSortPolicies(policies)
+		return &metav1.ListResult{Names: policies}, nil
+	}
+	return nil, fmt.Errorf("unknown command to list")
+}
+
+// PrintListResult writes a ListResult to the configured output using the
+// requested target and format. It accepts an optional destination writer
+// (e.g. cmd.OutOrStdout()), defaulting to os.Stdout when omitted or nil.
+func PrintListResult(ctx context.Context, result *metav1.ListResult, target, format string, writers ...io.Writer) error {
+	if result == nil {
+		return nil
+	}
+
+	format = strings.ToLower(strings.TrimSpace(format))
+	w := resolveWriter(writers...)
+
+	switch target {
+	case "controls":
+		switch format {
+		case "pretty-print":
+			return prettyPrintControls(ctx, result.Controls, w)
+		case "json":
+			return jsonControlsFormat(result.Controls, w)
+		case "yaml":
+			return yamlControlsFormat(result.Controls, w)
+		case "csv":
+			return csvControlsFormat(result.Controls, w)
+		default:
+			return fmt.Errorf("invalid format \"%s\", supported formats: 'pretty-print'/'json'/'yaml'/'csv'", format)
+		}
+	case "controls-config":
+		switch format {
+		case "pretty-print":
+			return prettyPrintControlsConfig(ctx, result.ControlsConfig, w)
+		case "json":
+			return jsonControlsConfigFormat(result.ControlsConfig, w)
+		case "yaml":
+			return yamlControlsConfigFormat(result.ControlsConfig, w)
+		case "csv":
+			return csvControlsConfigFormat(result.ControlsConfig, w)
+		default:
+			return fmt.Errorf("invalid format \"%s\", supported formats: 'pretty-print'/'json'/'yaml'/'csv'", format)
+		}
+	case "frameworks", "exceptions":
+		if listFormatFunction, ok := listFormatFunc[format]; ok {
+			return listFormatFunction(ctx, target, result.Names, w)
+		} else {
+			return fmt.Errorf("invalid format \"%s\", supported formats: 'pretty-print'/'json'/'yaml'/'csv'", format)
+		}
+	default:
+		return fmt.Errorf("invalid target %q, supported targets: 'controls'/'controls-config'/'frameworks'/'exceptions'", target)
+	}
+}
+
+// resolveWriter returns the first non-nil writer or defaults to os.Stdout.
+func resolveWriter(writers ...io.Writer) io.Writer {
+	if len(writers) > 0 && writers[0] != nil {
+		return writers[0]
+	}
+	return os.Stdout
+}
+
+// renderTable renders a table and writes its content to w, returning any write error.
+func renderTable(tbl table.Writer, w io.Writer) error {
+	outStr := tbl.Render()
+	if len(outStr) > 0 {
+		_, err := fmt.Fprintln(w, outStr)
+		return err
+	}
+	return nil
+}
+func naturalSortPolicies(policies []string) []string {
+	sort.Slice(policies, func(i, j int) bool {
+		return natural.Less(policies[i], policies[j])
+	})
+	return policies
+}
+
+func naturalSortControls(entries []metav1.ControlListEntry) []metav1.ControlListEntry {
+	sort.Slice(entries, func(i, j int) bool {
+		return natural.Less(entries[i].ID, entries[j].ID)
+	})
+	return entries
+}
+
+func listFrameworks(ctx context.Context, listPolicies *metav1.ListPolicies) ([]string, error) {
+	tenant := cautils.GetTenantConfig(ctx, listPolicies.AccountID, listPolicies.AccessKey, "", "", getKubernetesApi()) // change k8sinterface
+	policyGetter, err := getPolicyGetter(ctx, nil, tenant.GetAccountID(), true, nil, false)
+	if err != nil {
+		return nil, err
+	}
+
+	return listFrameworksNames(policyGetter), nil
+}
+
+func listControls(ctx context.Context, listPolicies *metav1.ListPolicies) ([]metav1.ControlListEntry, error) {
+	tenant := cautils.GetTenantConfig(ctx, listPolicies.AccountID, listPolicies.AccessKey, "", "", getKubernetesApi()) // change k8sinterface
+
+	policyGetter, err := getPolicyGetter(ctx, nil, tenant.GetAccountID(), false, nil, false)
+	if err != nil {
+		return nil, err
+	}
+	pipes, err := policyGetter.ListControls()
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]metav1.ControlListEntry, 0, len(pipes))
+	for _, pipe := range pipes {
+		entries = append(entries, parseControlEntry(pipe))
+	}
+	if framework := strings.TrimSpace(listPolicies.ControlFilters.Framework); framework != "" {
+		if err := checkFrameworkKnown(framework, listFrameworksNames(policyGetter), entries); err != nil {
+			return nil, err
+		}
+	}
+	return filterControlEntries(entries, listPolicies.ControlFilters), nil
+}
+
+// checkFrameworkKnown returns an error listing the known frameworks when
+// framework is neither in the catalog nor on any control, so that a misspelled
+// name is not mistaken for a framework without controls. Controls also carry
+// tags that the catalog does not list, and those count as known too. Names are
+// compared case-insensitively, as in filterControlEntries.
+func checkFrameworkKnown(framework string, catalog []string, entries []metav1.ControlListEntry) error {
+	known := make(map[string]struct{}, len(catalog))
+	addKnown := func(name string) {
+		if name = strings.TrimSpace(name); name != "" {
+			known[name] = struct{}{}
+		}
+	}
+	for _, name := range catalog {
+		addKnown(name)
+	}
+	for _, entry := range entries {
+		for _, name := range entry.Frameworks {
+			addKnown(name)
+		}
+	}
+
+	names := make([]string, 0, len(known))
+	for name := range known {
+		if strings.EqualFold(name, framework) {
+			return nil
+		}
+		names = append(names, name)
+	}
+	return fmt.Errorf("unknown framework %q; use one of: %s", framework, strings.Join(naturalSortPolicies(names), ", "))
+}
+
+// parseControlEntry converts a pipe-delimited "id|name|fw1, fw2" string into a ControlListEntry.
+func parseControlEntry(pipe string) metav1.ControlListEntry {
+	entry := metav1.ControlListEntry{Frameworks: []string{}}
+	if pipe == "" {
+		return entry
+	}
+
+	before, after, ok := strings.Cut(pipe, "|")
+	if !ok {
+		entry.ID = pipe
+		return entry
+	}
+	entry.ID = before
+
+	rest := after
+	last := strings.LastIndex(rest, "|")
+	if last == -1 {
+		entry.Name = rest
+		return entry
+	}
+
+	entry.Name = rest[:last]
+	frameworksRaw := rest[last+1:]
+	if frameworksRaw != "" {
+		for fw := range strings.SplitSeq(frameworksRaw, ",") {
+			if fw = strings.TrimSpace(fw); fw != "" {
+				entry.Frameworks = append(entry.Frameworks, fw)
+			}
+		}
+	}
+	return entry
+}
+
+func filterControlEntries(entries []metav1.ControlListEntry, filters metav1.ControlListFilters) []metav1.ControlListEntry {
+	framework := strings.TrimSpace(filters.Framework)
+	search := strings.TrimSpace(filters.Search)
+	if framework == "" && search == "" {
+		return entries
+	}
+
+	filtered := make([]metav1.ControlListEntry, 0, len(entries))
+	for _, entry := range entries {
+		if framework != "" && !controlEntryHasFramework(entry, framework) {
+			continue
+		}
+		if search != "" && !controlEntryMatchesSearch(entry, search) {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
+func controlEntryHasFramework(entry metav1.ControlListEntry, framework string) bool {
+	framework = strings.TrimSpace(framework)
+	for _, candidate := range entry.Frameworks {
+		if strings.EqualFold(strings.TrimSpace(candidate), framework) {
+			return true
+		}
+	}
+	return false
+}
+
+func controlEntryMatchesSearch(entry metav1.ControlListEntry, search string) bool {
+	search = strings.ToLower(search)
+	if strings.Contains(strings.ToLower(entry.ID), search) {
+		return true
+	}
+	if strings.Contains(strings.ToLower(entry.Name), search) {
+		return true
+	}
+	for _, framework := range entry.Frameworks {
+		if strings.Contains(strings.ToLower(framework), search) {
+			return true
+		}
+	}
+	return false
+}
+
+func listExceptions(ctx context.Context, listPolicies *metav1.ListPolicies) ([]string, error) {
+	// load tenant metav1
+	tenant := cautils.GetTenantConfig(ctx, listPolicies.AccountID, listPolicies.AccessKey, "", "", getKubernetesApi())
+
+	var exceptionsNames []string
+	// A cluster scan merges the SecurityException CRDs of the connected cluster,
+	// so leaving them out would list fewer exceptions than that scan applies.
+	ksCloudAPI, _, err := getExceptionsGetter(ctx, "", tenant.GetAccountID(), nil, true, false)
+	if err != nil {
+		return exceptionsNames, err
+	}
+	exceptions, err := ksCloudAPI.GetExceptions(ctx, "")
+	if err != nil {
+		return exceptionsNames, err
+	}
+	for i := range exceptions {
+		exceptionsNames = append(exceptionsNames, exceptions[i].Name)
+	}
+	return exceptionsNames, nil
+}
+
+func shouldColor(w io.Writer) bool {
+	if _, set := os.LookupEnv("NO_COLOR"); set {
+		return false
+	}
+	if gchalk.GetLevel() == gchalk.LevelNone {
+		return false
+	}
+	if f, ok := w.(*os.File); ok {
+		if val, set := os.LookupEnv("FORCE_COLOR"); set {
+			return val != "0"
+		}
+		return isTerminal(f.Fd()) || isCygwinTerminal(f.Fd())
+	}
+	return true
+}
+
+// prettyPrintListFormat renders policy names as a formatted table to the destination writer.
+func prettyPrintListFormat(ctx context.Context, targetPolicy string, policies []string, writers ...io.Writer) error {
+	w := resolveWriter(writers...)
+	colored := shouldColor(w)
+
+	policyTable := table.NewWriter()
+
+	header := fmt.Sprintf("Supported %s", targetPolicy)
+	headerRow := table.Row{header}
+	if colored {
+		headerRow = table.Row{gchalk.WithBrightWhite().Bold(header)}
+	}
+	policyTable.AppendHeader(headerRow)
+	policyTable.Style().Options.SeparateHeader = true
+	policyTable.Style().Options.SeparateRows = true
+	policyTable.Style().Format.HeaderAlign = text.AlignLeft
+	policyTable.Style().Format.Header = text.FormatDefault
+	policyTable.Style().Format.RowAlign = text.AlignCenter
+	policyTable.Style().Box = table.StyleBoxRounded
+
+	policyTable.AppendRows(generatePolicyRows(policies, colored))
+	return renderTable(policyTable, w)
+}
+
+// jsonListFormat serializes policy names as formatted JSON to the destination writer.
+func jsonListFormat(_ context.Context, _ string, policies []string, writers ...io.Writer) error {
+	j, err := json.MarshalIndent(policies, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal json: %w", err)
+	}
+
+	w := resolveWriter(writers...)
+	_, err = fmt.Fprintln(w, string(j))
+	return err
+}
+
+// jsonControlsFormat serializes control entries as formatted JSON to the destination writer.
+func jsonControlsFormat(entries []metav1.ControlListEntry, writers ...io.Writer) error {
+	j, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal json: %w", err)
+	}
+
+	w := resolveWriter(writers...)
+	_, err = fmt.Fprintln(w, string(j))
+	return err
+}
+
+// yamlListFormat serializes policy names as YAML to the destination writer.
+func yamlListFormat(_ context.Context, _ string, policies []string, writers ...io.Writer) error {
+	y, err := yaml.Marshal(policies)
+	if err != nil {
+		return fmt.Errorf("failed to marshal yaml: %w", err)
+	}
+
+	w := resolveWriter(writers...)
+	_, err = fmt.Fprint(w, string(y))
+	return err
+}
+
+// yamlControlsFormat serializes control entries as YAML to the destination writer.
+func yamlControlsFormat(entries []metav1.ControlListEntry, writers ...io.Writer) error {
+	y, err := yaml.Marshal(entries)
+	if err != nil {
+		return fmt.Errorf("failed to marshal yaml: %w", err)
+	}
+
+	w := resolveWriter(writers...)
+	_, err = fmt.Fprint(w, string(y))
+	return err
+}
+
+// csvSafeCell neutralizes a cell against spreadsheet formula injection (CWE-1236)
+// by delegating to csvsafe.SafeCell.
+func csvSafeCell(cell string) string {
+	return csvsafe.SafeCell(cell)
+}
+
+// csvSafeRow applies csvSafeCell across every cell of a CSV row.
+func csvSafeRow(row []string) []string {
+	return csvsafe.SafeRow(row)
+}
+
+// csvListFormat formats and writes policy names as CSV to the destination writer.
+func csvListFormat(_ context.Context, _ string, policies []string, writers ...io.Writer) error {
+	w := resolveWriter(writers...)
+	writer := csv.NewWriter(w)
+	if err := writer.Write([]string{"name"}); err != nil {
+		return err
+	}
+	for _, policy := range policies {
+		if err := writer.Write(csvSafeRow([]string{policy})); err != nil {
+			return err
+		}
+	}
+	writer.Flush()
+	return writer.Error()
+}
+
+// csvControlsFormat formats and writes control entries as CSV to the destination writer.
+func csvControlsFormat(entries []metav1.ControlListEntry, writers ...io.Writer) error {
+	w := resolveWriter(writers...)
+	writer := csv.NewWriter(w)
+	if err := writer.Write([]string{"id", "name", "frameworks"}); err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		frameworks := strings.Join(entry.Frameworks, ";")
+		if err := writer.Write(csvSafeRow([]string{entry.ID, entry.Name, frameworks})); err != nil {
+			return err
+		}
+	}
+	writer.Flush()
+	return writer.Error()
+}
+
+// prettyPrintControls renders control entries as a formatted table to the destination writer.
+func prettyPrintControls(ctx context.Context, entries []metav1.ControlListEntry, writers ...io.Writer) error {
+	w := resolveWriter(writers...)
+	colored := shouldColor(w)
+
+	controlsTable := table.NewWriter()
+
+	controlsTable.Style().Options.SeparateHeader = true
+	controlsTable.Style().Options.SeparateRows = true
+	controlsTable.Style().Format.HeaderAlign = text.AlignLeft
+	controlsTable.Style().Format.Header = text.FormatDefault
+	controlsTable.Style().Box = table.StyleBoxRounded
+	controlsTable.SetColumnConfigs([]table.ColumnConfig{{Number: 1, Align: text.AlignRight}})
+
+	uncoloredRows := generateControlRows(entries, false)
+	short := utils.CheckShortTerminalWidth(uncoloredRows, table.Row{"Control ID", "Control name", "Docs", "Frameworks"})
+	controlRows := generateControlRows(entries, colored)
+	if short {
+		header := "Controls"
+		if colored {
+			header = gchalk.WithBrightWhite().Bold(header)
+		}
+		controlsTable.AppendHeader(table.Row{header})
+		controlRows = shortFormatControlRows(controlRows, colored)
+	} else {
+		headerRow := table.Row{"Control ID", "Control name", "Docs", "Frameworks"}
+		if colored {
+			headerRow = table.Row{
+				gchalk.WithBrightWhite().Bold("Control ID"),
+				gchalk.WithBrightWhite().Bold("Control name"),
+				gchalk.WithBrightWhite().Bold("Docs"),
+				gchalk.WithBrightWhite().Bold("Frameworks"),
+			}
+		}
+		controlsTable.AppendHeader(headerRow)
+	}
+
+	controlsTable.AppendRows(controlRows)
+	return renderTable(controlsTable, w)
+}
+
+func generateControlRows(entries []metav1.ControlListEntry, colored ...bool) []table.Row {
+	isColored := len(colored) > 0 && colored[0]
+	rows := make([]table.Row, 0, len(entries))
+
+	for _, entry := range entries {
+		docs := cautils.GetControlLink(entry.ID)
+		frameworks := strings.Join(entry.Frameworks, "\n")
+		id := entry.ID
+		if isColored {
+			if id != "" {
+				id = gchalk.WithBrightCyan().Bold(entry.ID)
+			}
+			if docs != "" {
+				docs = gchalk.Cyan(docs)
+			}
+		}
+		rows = append(rows, table.Row{id, entry.Name, docs, frameworks})
+	}
+
+	return rows
+}
+
+func generatePolicyRows(policies []string, colored ...bool) []table.Row {
+	isColored := len(colored) > 0 && colored[0]
+	rows := make([]table.Row, 0, len(policies))
+
+	for _, policy := range policies {
+		val := policy
+		if isColored {
+			val = gchalk.WithBrightCyan().Bold(policy)
+		}
+		rows = append(rows, table.Row{val})
+	}
+	return rows
+}
+
+func shortFormatControlRows(controlRows []table.Row, colored ...bool) []table.Row {
+	isColored := len(colored) > 0 && colored[0]
+	rows := make([]table.Row, 0, len(controlRows))
+	for _, controlRow := range controlRows {
+		idLabel := "Control ID" + strings.Repeat(" ", 3)
+		nameLabel := "Control Name" + strings.Repeat(" ", 1)
+		docsLabel := "Docs" + strings.Repeat(" ", 9)
+		fwLabel := "Frameworks" + strings.Repeat(" ", 3)
+		if isColored {
+			idLabel = gchalk.WithBrightWhite().Bold("Control ID") + strings.Repeat(" ", 3)
+			nameLabel = gchalk.WithBrightWhite().Bold("Control Name") + strings.Repeat(" ", 1)
+			docsLabel = gchalk.WithBrightWhite().Bold("Docs") + strings.Repeat(" ", 9)
+			fwLabel = gchalk.WithBrightWhite().Bold("Frameworks") + strings.Repeat(" ", 3)
+		}
+		rows = append(rows, table.Row{fmt.Sprintf("%s: %+v\n%s: %+v\n%s: %+v\n%s: %+v", idLabel, controlRow[0], nameLabel, controlRow[1], docsLabel, controlRow[2], fwLabel, strings.ReplaceAll(controlRow[3].(string), "\n", " "))})
+	}
+	return rows
+}
+
+// listControlsConfig resolves the configurable inputs a scan evaluates controls
+// against, from the same sources a scan would use, and pairs each one with the
+// controls that read it.
+func listControlsConfig(ctx context.Context, listPolicies *metav1.ListPolicies) ([]metav1.ControlConfigEntry, error) {
+	k8s := getKubernetesApi()
+	tenant := cautils.GetTenantConfig(ctx, listPolicies.AccountID, listPolicies.AccessKey, "", "", k8s)
+
+	// Both getters fall back to the released regolibrary, and each builds its own
+	// downloader when given none, which fetches the release twice.
+	downloadReleasedPolicy := getter.NewDownloadReleasedPolicy()
+
+	// A cluster scan prefers the ControlInput CRD over the released defaults, so
+	// resolving without it would report values the next scan will not use.
+	configGetter, _, err := getConfigInputsGetterForTarget(ctx, listPolicies.ControlsInputs, tenant.GetAccountID(), downloadReleasedPolicy, k8s != nil, false, k8s)
+	if err != nil {
+		return nil, err
+	}
+	policyGetter, err := getPolicyGetter(ctx, nil, tenant.GetAccountID(), false, downloadReleasedPolicy, false)
+	if err != nil {
+		return nil, err
+	}
+
+	return controlsConfigEntries(ctx, configGetter, policyGetter, tenant.GetContextName())
+}
+
+// controlsConfigEntries pairs the resolved configuration with the controls that
+// read it. Both lookups are required: without the values there is nothing to
+// report, and without the policies every entry would be an orphan.
+func controlsConfigEntries(ctx context.Context, configGetter getter.IControlsInputsGetter, policyGetter getter.IPolicyGetter, clusterName string) ([]metav1.ControlConfigEntry, error) {
+	values, err := configGetter.GetControlsInputs(ctx, clusterName)
+	if err != nil {
+		return nil, err
+	}
+
+	frameworks, err := policyGetter.GetFrameworks()
+	if err != nil {
+		return nil, err
+	}
+
+	return buildControlsConfigEntries(values, frameworks), nil
+}
+
+// buildControlsConfigEntries indexes every configurable input declared by a
+// control against the resolved values. Inputs a control declares but the
+// configuration does not set are still listed, with no values, since an unset
+// input is what makes a configurable control fall back to its rule default.
+func buildControlsConfigEntries(values map[string][]string, frameworks []reporthandling.Framework) []metav1.ControlConfigEntry {
+	titles := map[string]string{}
+	descriptions := map[string]string{}
+	controls := map[string]map[string]struct{}{}
+
+	for i := range frameworks {
+		for j := range frameworks[i].Controls {
+			control := &frameworks[i].Controls[j]
+			for k := range control.Rules {
+				for _, input := range control.Rules[k].ControlConfigInputs {
+					key := configInputKey(input)
+					if key == "" {
+						continue
+					}
+					if _, ok := controls[key]; !ok {
+						controls[key] = map[string]struct{}{}
+					}
+					controls[key][control.ControlID] = struct{}{}
+					if titles[key] == "" {
+						titles[key] = input.Name
+					}
+					if descriptions[key] == "" {
+						descriptions[key] = input.Description
+					}
+				}
+			}
+		}
+	}
+
+	names := make([]string, 0, len(values)+len(controls))
+	seen := map[string]struct{}{}
+	for name := range values {
+		names = append(names, name)
+		seen[name] = struct{}{}
+	}
+	for name := range controls {
+		if _, ok := seen[name]; !ok {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+
+	entries := make([]metav1.ControlConfigEntry, 0, len(names))
+	for _, name := range names {
+		entries = append(entries, metav1.ControlConfigEntry{
+			Name:        name,
+			Title:       titles[name],
+			Description: descriptions[name],
+			Values:      append([]string{}, values[name]...),
+			Controls:    sortedKeys(controls[name]),
+		})
+	}
+	return entries
+}
+
+// configInputKey returns the controls-config key a declared input reads. The
+// controls address it by a dotted path such as
+// settings.postureControlInputs.imageRepositoryAllowList, while a
+// controls-config file is keyed by the last segment alone.
+func configInputKey(input reporthandling.ControlConfigInputs) string {
+	if input.Path != "" {
+		if idx := strings.LastIndex(input.Path, "."); idx != -1 {
+			return input.Path[idx+1:]
+		}
+		return input.Path
+	}
+	return input.Name
+}
+
+func sortedKeys(set map[string]struct{}) []string {
+	keys := make([]string, 0, len(set))
+	for key := range set {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// jsonControlsConfigFormat serializes control configuration entries as formatted JSON to the destination writer.
+func jsonControlsConfigFormat(entries []metav1.ControlConfigEntry, writers ...io.Writer) error {
+	j, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal json: %w", err)
+	}
+
+	w := resolveWriter(writers...)
+	_, err = fmt.Fprintln(w, string(j))
+	return err
+}
+
+// yamlControlsConfigFormat serializes control configuration entries as YAML to the destination writer.
+func yamlControlsConfigFormat(entries []metav1.ControlConfigEntry, writers ...io.Writer) error {
+	y, err := yaml.Marshal(entries)
+	if err != nil {
+		return fmt.Errorf("failed to marshal yaml: %w", err)
+	}
+
+	w := resolveWriter(writers...)
+	_, err = fmt.Fprint(w, string(y))
+	return err
+}
+
+// csvControlsConfigFormat formats and writes control configuration entries as CSV to the destination writer.
+func csvControlsConfigFormat(entries []metav1.ControlConfigEntry, writers ...io.Writer) error {
+	w := resolveWriter(writers...)
+	writer := csv.NewWriter(w)
+	if err := writer.Write([]string{"name", "title", "values", "controls", "description"}); err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := writer.Write(csvSafeRow([]string{
+			entry.Name,
+			entry.Title,
+			strings.Join(entry.Values, ";"),
+			strings.Join(entry.Controls, ";"),
+			entry.Description,
+		})); err != nil {
+			return err
+		}
+	}
+	writer.Flush()
+	return writer.Error()
+}
+
+// prettyPrintControlsConfig renders control configuration entries as a formatted table to the destination writer.
+func prettyPrintControlsConfig(ctx context.Context, entries []metav1.ControlConfigEntry, writers ...io.Writer) error {
+	w := resolveWriter(writers...)
+	colored := shouldColor(w)
+
+	configTable := table.NewWriter()
+
+	configTable.Style().Options.SeparateHeader = true
+	configTable.Style().Options.SeparateRows = true
+	configTable.Style().Format.HeaderAlign = text.AlignLeft
+	configTable.Style().Format.Header = text.FormatDefault
+	configTable.Style().Box = table.StyleBoxRounded
+
+	rows := make([]table.Row, 0, len(entries))
+	for _, entry := range entries {
+		values := strings.Join(entry.Values, "\n")
+		displayValues := values
+		if values == "" {
+			if colored {
+				displayValues = gchalk.Yellow("<unset>")
+			} else {
+				displayValues = "<unset>"
+			}
+		}
+		name := entry.Name
+		controls := strings.Join(entry.Controls, "\n")
+		if colored {
+			name = gchalk.WithBrightCyan().Bold(entry.Name)
+			if len(entry.Controls) > 0 {
+				controls = gchalk.Cyan(controls)
+			}
+		}
+		rows = append(rows, table.Row{name, entry.Title, displayValues, controls})
+	}
+
+	headerRow := table.Row{"Key", "Configuration", "Value", "Controls"}
+	if colored {
+		headerRow = table.Row{
+			gchalk.WithBrightWhite().Bold("Key"),
+			gchalk.WithBrightWhite().Bold("Configuration"),
+			gchalk.WithBrightWhite().Bold("Value"),
+			gchalk.WithBrightWhite().Bold("Controls"),
+		}
+	}
+	configTable.AppendHeader(headerRow)
+	configTable.AppendRows(rows)
+	return renderTable(configTable, w)
+}

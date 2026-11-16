@@ -1,0 +1,331 @@
+package imagescan
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+)
+
+// HarborAPI defines the interface for Harbor HTTP interactions to enable mocking
+type HarborAPI interface {
+	DoRequest(ctx context.Context, method, path string) ([]byte, error)
+}
+
+type harborAPIWrapper struct {
+	baseURL         string
+	username        string
+	password        string
+	token           string
+	httpClient      *http.Client
+	maxResponseSize int64
+}
+
+func (w *harborAPIWrapper) DoRequest(ctx context.Context, method, path string) ([]byte, error) {
+	reqUrl := fmt.Sprintf("%s%s", w.baseURL, path)
+	req, err := http.NewRequestWithContext(ctx, method, reqUrl, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if w.token != "" {
+		req.Header.Set("Authorization", "Bearer "+w.token)
+	} else if w.username != "" && w.password != "" {
+		req.SetBasicAuth(w.username, w.password)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := registryAPIHTTPClient(w.httpClient).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("harbor api returned status %d for %s", resp.StatusCode, path)
+	}
+
+	return readRegistryAPIResponse(resp.Body, w.maxResponseSize)
+}
+
+// HarborAdaptor implements IContainerImageVulnerabilityAdaptor for Harbor Container Registry.
+type HarborAdaptor struct {
+	mu     sync.RWMutex
+	client HarborAPI
+	host   string
+}
+
+func (a *HarborAdaptor) getSession() (HarborAPI, string, error) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.client == nil {
+		return nil, "", fmt.Errorf("harbor client not initialized, call login first")
+	}
+	return a.client, a.host, nil
+}
+
+type harborScanOverview struct {
+	ScanStatus string `json:"scan_status"`
+	EndTime    string `json:"end_time"`
+}
+
+// NewHarborAdaptor creates a new Harbor adaptor instance.
+func NewHarborAdaptor() *HarborAdaptor {
+	return &HarborAdaptor{}
+}
+
+// Login authenticates with Harbor. The registry string should be the host (e.g. core.harbor.domain).
+func (a *HarborAdaptor) Login(ctx context.Context, registry string, credentials RegistryCredentials) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// Invalidate any previous session immediately so failed re-login does not leave stale authenticated state
+	a.client = nil
+	a.host = ""
+
+	cleanHost := registry
+	scheme := "https"
+	if strings.HasPrefix(cleanHost, "http://") {
+		scheme = "http"
+		cleanHost = strings.TrimPrefix(cleanHost, "http://")
+	} else {
+		cleanHost = strings.TrimPrefix(cleanHost, "https://")
+	}
+
+	baseURL := fmt.Sprintf("%s://%s", scheme, cleanHost)
+
+	wrapper := &harborAPIWrapper{
+		baseURL:         baseURL,
+		httpClient:      &http.Client{Timeout: 15 * time.Second},
+		maxResponseSize: maxRegistryAPIResponseBytes,
+	}
+
+	if credentials.hasAuthenticator() {
+		wrapper.username = credentials.Username
+		wrapper.password = credentials.Password
+		wrapper.token = credentials.Token
+	}
+
+	// Ping to verify connectivity. Note: /api/v2.0/systeminfo permits anonymous requests,
+	// so this primarily validates that the Harbor endpoint is reachable and the URL is correct,
+	// rather than strictly verifying the validity of the credentials for all projects.
+	// We rely on actual vulnerability fetch calls to return 401/403 if credentials are invalid.
+	_, err := wrapper.DoRequest(ctx, http.MethodGet, "/api/v2.0/systeminfo")
+	if err != nil {
+		return fmt.Errorf("failed to connect to harbor at %s: %w", baseURL, err)
+	}
+
+	a.client = wrapper
+	a.host = registry
+	return nil
+}
+
+// DescribeAdaptor provides a string description of the adaptor for help purposes.
+func (a *HarborAdaptor) DescribeAdaptor() string {
+	return "Harbor Container Registry Vulnerability Adaptor"
+}
+
+// extractProjectAndRepo splits the image repository string (e.g. myproject/myrepo) into project and repository parts
+func extractProjectAndRepo(repo string) (string, string, error) {
+	parts := strings.SplitN(repo, "/", 2)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("invalid harbor repository format: expected project/repository, got %s", repo)
+	}
+	return parts[0], parts[1], nil
+}
+
+// harborRepositoryPathSegment encodes a repository name for Harbor's v2 API.
+// Harbor repository names may contain slashes below the project, but the API
+// models the entire name as one path parameter. Those slashes must therefore
+// survive the HTTP stack as an encoded value. Escaping the percent sign in
+// %2F once more keeps a nested repository from being interpreted as extra URL
+// path segments before Harbor's repository handler receives it.
+func harborRepositoryPathSegment(repository string) string {
+	escaped := url.PathEscape(repository)
+	return strings.ReplaceAll(escaped, "%2F", "%252F")
+}
+
+// GetImagesScanStatus retrieves the scan status for a list of image identifiers.
+func (a *HarborAdaptor) GetImagesScanStatus(ctx context.Context, imageIDs []ContainerImageIdentifier) ([]ContainerImageScanStatus, error) {
+	client, host, err := a.getSession()
+	if err != nil {
+		return nil, err
+	}
+
+	return ProcessImages(imageIDs, func(imageID ContainerImageIdentifier) (ContainerImageScanStatus, error) {
+		status := ContainerImageScanStatus{
+			ImageID:         imageID,
+			IsScanAvailable: false,
+			IsBomAvailable:  false,
+		}
+
+		ref := imageID.Hash
+		if ref == "" {
+			ref = imageID.Tag
+		}
+		if ref == "" {
+			return status, nil
+		}
+		if err := a.validateImageRegistry(imageID, host); err != nil {
+			return status, err
+		}
+
+		project, repo, err := extractProjectAndRepo(imageID.Repository)
+		if err != nil {
+			return status, fmt.Errorf("failed to extract project from repository %s: %w", imageID.Repository, err)
+		}
+
+		path := fmt.Sprintf("/api/v2.0/projects/%s/repositories/%s/artifacts/%s?with_scan_overview=true",
+			url.PathEscape(project),
+			harborRepositoryPathSegment(repo),
+			url.PathEscape(ref))
+
+		data, err := client.DoRequest(ctx, http.MethodGet, path)
+		if err != nil {
+			return status, fmt.Errorf("failed to query scan status for repository %s: %w", repo, err)
+		}
+
+		var artifact struct {
+			ScanOverview map[string]harborScanOverview `json:"scan_overview"`
+		}
+
+		if err := json.Unmarshal(data, &artifact); err != nil {
+			return status, fmt.Errorf("failed to parse scan status payload for repository %s: %w", repo, err)
+		}
+
+		status.IsScanAvailable, status.LastScanDate = latestSuccessfulHarborScan(artifact.ScanOverview)
+		if status.IsScanAvailable {
+			status.Status = ScanStatusScanned
+		}
+
+		return status, nil
+	})
+}
+
+// latestSuccessfulHarborScan reduces all scanner reports attached to an
+// artifact. Harbor keys scan_overview by report media type, so iteration order
+// is deliberately unspecified. Selecting the first successful entry can make
+// LastScanDate move backwards between identical requests when an artifact has
+// reports from more than one scanner or report schema.
+func latestSuccessfulHarborScan(overviews map[string]harborScanOverview) (bool, time.Time) {
+	available := false
+	var latest time.Time
+
+	for _, overview := range overviews {
+		if !strings.EqualFold(overview.ScanStatus, "Success") {
+			continue
+		}
+
+		available = true
+		completedAt, err := time.Parse(time.RFC3339, overview.EndTime)
+		if err == nil && completedAt.After(latest) {
+			latest = completedAt
+		}
+	}
+
+	return available, latest
+}
+
+// GetImagesVulnerabilities retrieves the vulnerability reports for a list of image identifiers.
+func (a *HarborAdaptor) GetImagesVulnerabilities(ctx context.Context, imageIDs []ContainerImageIdentifier) ([]ContainerImageVulnerabilityReport, error) {
+	client, host, err := a.getSession()
+	if err != nil {
+		return nil, err
+	}
+
+	return ProcessImages(imageIDs, func(imageID ContainerImageIdentifier) (ContainerImageVulnerabilityReport, error) {
+		report := ContainerImageVulnerabilityReport{
+			ImageID:         imageID,
+			Vulnerabilities: []Vulnerability{},
+		}
+
+		ref := imageID.Hash
+		if ref == "" {
+			ref = imageID.Tag
+		}
+		if ref == "" {
+			return report, nil
+		}
+		if err := a.validateImageRegistry(imageID, host); err != nil {
+			return report, err
+		}
+
+		project, repo, err := extractProjectAndRepo(imageID.Repository)
+		if err != nil {
+			return report, fmt.Errorf("failed to extract project from repository %s: %w", imageID.Repository, err)
+		}
+
+		path := fmt.Sprintf("/api/v2.0/projects/%s/repositories/%s/artifacts/%s/additions/vulnerabilities",
+			url.PathEscape(project),
+			harborRepositoryPathSegment(repo),
+			url.PathEscape(ref))
+
+		data, err := client.DoRequest(ctx, http.MethodGet, path)
+		if err != nil {
+			return report, fmt.Errorf("failed to query vulnerabilities for repository %s: %w", repo, err)
+		}
+
+		var harborVulnPayload map[string]struct {
+			Vulnerabilities []struct {
+				ID          string   `json:"id"`
+				Severity    string   `json:"severity"`
+				Description string   `json:"description"`
+				Links       []string `json:"links"`
+			} `json:"vulnerabilities"`
+		}
+
+		if err := json.Unmarshal(data, &harborVulnPayload); err != nil {
+			return report, fmt.Errorf("failed to parse vulnerability payload for repository %s: %w", repo, err)
+		}
+		if len(harborVulnPayload) == 0 {
+			return report, fmt.Errorf("missing vulnerability report for repository %s", repo)
+		}
+
+		var reportErr error
+		for mimeType, mimeTypeData := range harborVulnPayload {
+			// Harbor emits an explicit empty array for a clean scan. A null
+			// report or missing/null findings is not evidence of completion.
+			if mimeTypeData.Vulnerabilities == nil {
+				reportErr = errors.Join(reportErr, fmt.Errorf("invalid vulnerability report %q for repository %s: vulnerabilities must be an array", mimeType, repo))
+				continue
+			}
+			for _, v := range mimeTypeData.Vulnerabilities {
+				vuln := Vulnerability{
+					ID:          v.ID,
+					Severity:    NormalizeSeverity(v.Severity),
+					Description: v.Description,
+					Links:       v.Links,
+				}
+				report.Vulnerabilities = append(report.Vulnerabilities, vuln)
+			}
+		}
+
+		if reportErr == nil {
+			report.Status = ScanStatusScanned
+		}
+		return report, reportErr
+	})
+}
+
+// GetImagesInformation retrieves the BOM and manifest information for a list of image identifiers.
+func (a *HarborAdaptor) GetImagesInformation(ctx context.Context, imageIDs []ContainerImageIdentifier) ([]ContainerImageInformation, error) {
+	if _, _, err := a.getSession(); err != nil {
+		return nil, err
+	}
+
+	return FetchImagesInformation(imageIDs)
+}
+
+// Destroy cleans up any persistent resources used by the adaptor.
+func (a *HarborAdaptor) Destroy() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.client = nil
+	a.host = ""
+	return nil
+}

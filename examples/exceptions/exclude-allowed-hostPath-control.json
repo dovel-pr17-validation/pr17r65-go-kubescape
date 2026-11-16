@@ -1,0 +1,22 @@
+[
+    {
+        "name": "exclude-allowed-hostPath-control",
+        "policyType": "postureExceptionPolicy",
+        "actions": [
+            "disable"
+        ],
+        "resources": [
+            {
+                "designatorType": "Attributes",
+                "attributes": {
+                    "kind": ".*"
+                }
+            }
+        ],
+        "posturePolicies": [
+            {
+                "controlName": "HostPath mount" 
+            }
+        ]
+    }
+]

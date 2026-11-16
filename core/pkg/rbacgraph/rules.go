@@ -1,0 +1,128 @@
+package rbacgraph
+
+import (
+	"slices"
+
+	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
+)
+
+// ruleGrants reports whether rule grants verb on the given apiGroup and
+// resource (a "*" entry in any of rule's Verbs/APIGroups/Resources matches
+// anything, per RBAC's own wildcard semantics).
+func ruleGrants(rule rbacv1.PolicyRule, apiGroup, resource, verb string) bool {
+	return containsOrWildcard(rule.APIGroups, apiGroup) &&
+		containsOrWildcard(rule.Resources, resource) &&
+		containsOrWildcard(rule.Verbs, verb)
+}
+
+// ruleGrantsSubresource is ruleGrants for a request on a subresource. A rule
+// can name one three ways: "*" for every resource, the exact
+// "resource/subresource", or "*/subresource" for that subresource of every
+// resource. This follows ResourceMatches in Kubernetes'
+// pkg/apis/rbac/v1/evaluation_helpers.go.
+func ruleGrantsSubresource(rule rbacv1.PolicyRule, apiGroup, resource, subresource, verb string) bool {
+	return containsOrWildcard(rule.APIGroups, apiGroup) &&
+		subresourceMatches(rule.Resources, resource, subresource) &&
+		containsOrWildcard(rule.Verbs, verb)
+}
+
+func subresourceMatches(ruleResources []string, resource, subresource string) bool {
+	for _, r := range ruleResources {
+		if r == "*" || r == resource+"/"+subresource || r == "*/"+subresource {
+			return true
+		}
+	}
+	return false
+}
+
+func containsOrWildcard(list []string, want string) bool {
+	for _, v := range list {
+		if v == "*" || v == want {
+			return true
+		}
+	}
+	return false
+}
+
+// namedResources reports whether rule (already confirmed to grant the verb
+// in question) restricts to specific object names, and if so, what they
+// are. An empty rule.ResourceNames means no restriction -- the rule applies
+// to every object of that resource type, not to none.
+func namedResources(rule rbacv1.PolicyRule) (names []string, restricted bool) {
+	if len(rule.ResourceNames) == 0 {
+		return nil, false
+	}
+	return rule.ResourceNames, true
+}
+
+// resourceNameMatches follows the RBAC authorizer's literal name comparison.
+// Unlike verbs, resources and API groups, resourceNames has no wildcard:
+// ["*"] grants access only to an object actually named "*".
+func resourceNameMatches(names []string, name string) bool {
+	return slices.Contains(names, name)
+}
+
+// ruleGrantsUnnamedCreate reports whether rule grants "create" on the given
+// apiGroup/resource for a request that names no object. A top-level create
+// is such a request -- the object doesn't exist yet -- so the authorizer
+// compares the rule's resourceNames with the empty string: a rule restricted
+// to real names authorizes nothing for create, not "every object of that
+// type", and only an unrestricted rule or one that lists "" does.
+// Only used for top-level collection creates (pods and the other workloads,
+// rolebindings,
+// clusterrolebindings); a subresource create on an already-named parent
+// object (e.g. serviceaccounts/token) does have a real object name to
+// match against and should use ruleGrantsSubresource directly instead.
+func ruleGrantsUnnamedCreate(rule rbacv1.PolicyRule, apiGroup, resource string) bool {
+	return ruleGrants(rule, apiGroup, resource, "create") &&
+		(len(rule.ResourceNames) == 0 || resourceNameMatches(rule.ResourceNames, ""))
+}
+
+// ruleGrantsExistingObject reports whether rule grants verb on apiGroup/
+// resource for a request that names an existing object, as update and patch
+// do. Unlike a create, such a request has a real name, so a rule restricted
+// by resourceNames grants it for those names -- but only a name some object
+// of that resource can actually carry. resourceNames is matched literally,
+// so "*" names an object called "*", which no workload can be: the empty name
+// and any other entry that is not a valid name for the resource identify
+// nothing, and a rule listing only those grants nothing.
+func ruleGrantsExistingObject(rule rbacv1.PolicyRule, apiGroup, resource, verb string) bool {
+	return ruleGrants(rule, apiGroup, resource, verb) &&
+		(len(rule.ResourceNames) == 0 || slices.ContainsFunc(rule.ResourceNames, func(name string) bool {
+			return isWorkloadName(resource, name)
+		}))
+}
+
+// isWorkloadName reports whether name is syntactically valid for an object of
+// the given workload resource, which also rules out "" and "*". Kubernetes
+// validates a StatefulSet name as a DNS-1123 label, because the name is part of
+// its pods' hostnames (ValidateStatefulSetName), and every other workload this
+// is used for as a DNS-1123 subdomain. CronJob names are additionally limited
+// to 52 characters; that is not enforced, so a 53 to 253 character name is
+// still accepted -- an over-report of an impossible object, never a missed
+// grant.
+func isWorkloadName(resource, name string) bool {
+	if resource == "statefulsets" {
+		return len(validation.IsDNS1123Label(name)) == 0
+	}
+	return len(validation.IsDNS1123Subdomain(name)) == 0
+}
+
+func setToSlice(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	return out
+}
+
+func intersectSets(a, b map[string]bool) []string {
+	var out []string
+	for k := range a {
+		if b[k] {
+			out = append(out, k)
+		}
+	}
+	return out
+}

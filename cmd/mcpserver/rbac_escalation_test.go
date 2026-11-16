@@ -1,0 +1,466 @@
+package mcpserver
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"testing"
+
+	"github.com/kubescape/k8s-interface/k8sinterface"
+	"github.com/mark3labs/mcp-go/server"
+	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+	k8stesting "k8s.io/client-go/testing"
+)
+
+func newRBACEscalationTestServer(t *testing.T, objects ...runtime.Object) *KubescapeMcpserver {
+	t.Helper()
+	listKinds := map[schema.GroupVersionResource]string{
+		roleGVR:               "RoleList",
+		clusterRoleGVR:        "ClusterRoleList",
+		roleBindingGVR:        "RoleBindingList",
+		clusterRoleBindingGVR: "ClusterRoleBindingList",
+		serviceAccountGVR:     "ServiceAccountList",
+	}
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), listKinds, objects...)
+
+	ksServer := &KubescapeMcpserver{
+		s: server.NewMCPServer(
+			"kubescape-test",
+			"test",
+			server.WithToolCapabilities(false),
+			server.WithRecovery(),
+		),
+		k8sClient: &k8sinterface.KubernetesApi{DynamicClient: dyn},
+	}
+	createRBACEscalationTools(ksServer)
+	return ksServer
+}
+
+func unstructuredServiceAccount(namespace, name string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ServiceAccount",
+		"metadata":   map[string]any{"name": name, "namespace": namespace},
+	}}
+}
+
+func unstructuredPolicyRule(apiGroups, resources, verbs, resourceNames []string) map[string]any {
+	m := map[string]any{
+		"apiGroups": toAnySlice(apiGroups),
+		"resources": toAnySlice(resources),
+		"verbs":     toAnySlice(verbs),
+	}
+	if len(resourceNames) > 0 {
+		m["resourceNames"] = toAnySlice(resourceNames)
+	}
+	return m
+}
+
+func toAnySlice(s []string) []any {
+	out := make([]any, len(s))
+	for i, v := range s {
+		out[i] = v
+	}
+	return out
+}
+
+func unstructuredClusterRole(name string, rules ...map[string]any) *unstructured.Unstructured {
+	ruleList := make([]any, len(rules))
+	for i, r := range rules {
+		ruleList[i] = r
+	}
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "rbac.authorization.k8s.io/v1",
+		"kind":       "ClusterRole",
+		"metadata":   map[string]any{"name": name},
+		"rules":      ruleList,
+	}}
+}
+
+func unstructuredClusterRoleBinding(name, clusterRoleName string, subjectNamespace, subjectName string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "rbac.authorization.k8s.io/v1",
+		"kind":       "ClusterRoleBinding",
+		"metadata":   map[string]any{"name": name},
+		"roleRef": map[string]any{
+			"apiGroup": "rbac.authorization.k8s.io",
+			"kind":     "ClusterRole",
+			"name":     clusterRoleName,
+		},
+		"subjects": []any{
+			map[string]any{"kind": "ServiceAccount", "namespace": subjectNamespace, "name": subjectName},
+		},
+	}}
+}
+
+func TestAnalyzeRBACEscalationPaths_NoEscalationReportsEmptyResult(t *testing.T) {
+	sa := unstructuredServiceAccount("prod", "app")
+	cr := unstructuredClusterRole("pod-reader", unstructuredPolicyRule([]string{""}, []string{"pods"}, []string{"get"}, nil))
+	crb := unstructuredClusterRoleBinding("crb", "pod-reader", "prod", "app")
+	ksServer := newRBACEscalationTestServer(t, sa, cr, crb)
+
+	result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{
+		"subject_kind": "ServiceAccount",
+		"namespace":    "prod",
+		"name":         "app",
+	}))
+	require.False(t, result.IsError)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(toolResultText(t, result)), &parsed))
+	require.False(t, parsed["cluster_admin_equivalent"].(bool))
+	require.Empty(t, parsed["reached"])
+}
+
+func TestAnalyzeRBACEscalationPaths_ImpersonateReachesNamedServiceAccount(t *testing.T) {
+	attackerSA := unstructuredServiceAccount("prod", "attacker")
+	targetSA := unstructuredServiceAccount("prod", "target")
+	impersonator := unstructuredClusterRole("impersonator", unstructuredPolicyRule([]string{""}, []string{"serviceaccounts"}, []string{"impersonate"}, []string{"target"}))
+	crb := unstructuredClusterRoleBinding("crb", "impersonator", "prod", "attacker")
+	ksServer := newRBACEscalationTestServer(t, attackerSA, targetSA, impersonator, crb)
+
+	result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{
+		"subject_kind": "ServiceAccount",
+		"namespace":    "prod",
+		"name":         "attacker",
+	}))
+	require.False(t, result.IsError)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(toolResultText(t, result)), &parsed))
+	reached := parsed["reached"].([]any)
+	require.Len(t, reached, 1)
+	entry := reached[0].(map[string]any)
+	require.Equal(t, "ServiceAccount prod/target", entry["subject"])
+	path := entry["path"].([]any)
+	require.Len(t, path, 1)
+	require.Equal(t, "impersonate", path[0].(map[string]any)["primitive"])
+}
+
+func TestAnalyzeRBACEscalationPaths_BindClusterAdminClusterRoleIsFlagged(t *testing.T) {
+	attackerSA := unstructuredServiceAccount("prod", "attacker")
+	adminRole := unstructuredClusterRole("cluster-admin-ish", unstructuredPolicyRule([]string{"*"}, []string{"*"}, []string{"*"}, nil))
+	binder := unstructuredClusterRole("binder", unstructuredPolicyRule([]string{"rbac.authorization.k8s.io"}, []string{"clusterroles"}, []string{"bind"}, []string{"cluster-admin-ish"}))
+	crbCreator := unstructuredClusterRole("crb-creator", unstructuredPolicyRule([]string{"rbac.authorization.k8s.io"}, []string{"clusterrolebindings"}, []string{"create"}, nil))
+	ksServer := newRBACEscalationTestServer(t,
+		attackerSA, adminRole, binder, crbCreator,
+		unstructuredClusterRoleBinding("crb1", "binder", "prod", "attacker"),
+		unstructuredClusterRoleBinding("crb2", "crb-creator", "prod", "attacker"),
+	)
+
+	result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{
+		"subject_kind": "ServiceAccount",
+		"namespace":    "prod",
+		"name":         "attacker",
+	}))
+	require.False(t, result.IsError)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(toolResultText(t, result)), &parsed))
+	require.True(t, parsed["cluster_admin_equivalent"].(bool), "bind+create-clusterrolebindings to a */*/* ClusterRole must be flagged cluster-admin-equivalent")
+}
+
+func TestAnalyzeRBACEscalationPaths_MissingNameReturnsError(t *testing.T) {
+	ksServer := newRBACEscalationTestServer(t)
+	result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{
+		"subject_kind": "ServiceAccount",
+		"namespace":    "prod",
+	}))
+	require.True(t, result.IsError)
+	te := parsePSSToolError(t, result)
+	require.Equal(t, ErrCodeInvalidArgument, te.Code)
+	require.Equal(t, "name", te.Details["argument"])
+}
+
+func TestAnalyzeRBACEscalationPaths_NullNameReturnsError(t *testing.T) {
+	ksServer := newRBACEscalationTestServer(t)
+	result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{
+		"subject_kind": "ServiceAccount",
+		"name":         nil,
+		"namespace":    "prod",
+	}))
+	require.True(t, result.IsError)
+	te := parsePSSToolError(t, result)
+	require.Equal(t, ErrCodeInvalidArgument, te.Code)
+	require.Equal(t, "name", te.Details["argument"])
+}
+
+func TestAnalyzeRBACEscalationPaths_NonStringNameReturnsError(t *testing.T) {
+	ksServer := newRBACEscalationTestServer(t)
+	result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{
+		"subject_kind": "ServiceAccount",
+		"name":         12345,
+		"namespace":    "prod",
+	}))
+	require.True(t, result.IsError)
+	te := parsePSSToolError(t, result)
+	require.Equal(t, ErrCodeInvalidArgument, te.Code)
+	require.Equal(t, "name", te.Details["argument"])
+}
+
+func TestAnalyzeRBACEscalationPaths_WhitespaceOnlyNameReturnsError(t *testing.T) {
+	ksServer := newRBACEscalationTestServer(t)
+	result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{
+		"subject_kind": "ServiceAccount",
+		"name":         "   ",
+		"namespace":    "prod",
+	}))
+	require.True(t, result.IsError)
+	te := parsePSSToolError(t, result)
+	require.Equal(t, ErrCodeInvalidArgument, te.Code)
+	require.Equal(t, "name", te.Details["argument"])
+}
+
+func TestAnalyzeRBACEscalationPaths_MissingSubjectKindReturnsError(t *testing.T) {
+	ksServer := newRBACEscalationTestServer(t)
+	result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{
+		"name":      "app",
+		"namespace": "prod",
+	}))
+	require.True(t, result.IsError)
+	te := parsePSSToolError(t, result)
+	require.Equal(t, ErrCodeInvalidArgument, te.Code)
+	require.Equal(t, "subject_kind", te.Details["argument"])
+}
+
+func TestAnalyzeRBACEscalationPaths_NullSubjectKindReturnsError(t *testing.T) {
+	ksServer := newRBACEscalationTestServer(t)
+	result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{
+		"subject_kind": nil,
+		"name":         "app",
+		"namespace":    "prod",
+	}))
+	require.True(t, result.IsError)
+	te := parsePSSToolError(t, result)
+	require.Equal(t, ErrCodeInvalidArgument, te.Code)
+	require.Equal(t, "subject_kind", te.Details["argument"])
+}
+
+func TestAnalyzeRBACEscalationPaths_NonStringSubjectKindReturnsError(t *testing.T) {
+	ksServer := newRBACEscalationTestServer(t)
+	result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{
+		"subject_kind": 12345,
+		"name":         "app",
+		"namespace":    "prod",
+	}))
+	require.True(t, result.IsError)
+	te := parsePSSToolError(t, result)
+	require.Equal(t, ErrCodeInvalidArgument, te.Code)
+	require.Equal(t, "subject_kind", te.Details["argument"])
+}
+
+func TestAnalyzeRBACEscalationPaths_WhitespaceOnlySubjectKindReturnsError(t *testing.T) {
+	ksServer := newRBACEscalationTestServer(t)
+	result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{
+		"subject_kind": "   ",
+		"name":         "app",
+		"namespace":    "prod",
+	}))
+	require.True(t, result.IsError)
+	te := parsePSSToolError(t, result)
+	require.Equal(t, ErrCodeInvalidArgument, te.Code)
+	require.Equal(t, "subject_kind", te.Details["argument"])
+}
+
+func TestAnalyzeRBACEscalationPaths_NonStringNamespaceReturnsError(t *testing.T) {
+	ksServer := newRBACEscalationTestServer(t)
+	result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{
+		"subject_kind": "User",
+		"name":         "alice",
+		"namespace":    12345,
+	}))
+	require.True(t, result.IsError)
+	te := parsePSSToolError(t, result)
+	require.Equal(t, ErrCodeInvalidArgument, te.Code)
+	require.Equal(t, "namespace", te.Details["argument"])
+}
+
+func TestAnalyzeRBACEscalationPaths_ServiceAccountWithoutNamespaceReturnsError(t *testing.T) {
+	ksServer := newRBACEscalationTestServer(t)
+	result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{
+		"subject_kind": "ServiceAccount",
+		"name":         "app",
+	}))
+	require.True(t, result.IsError)
+	te := parsePSSToolError(t, result)
+	require.Equal(t, ErrCodeInvalidArgument, te.Code)
+	require.Equal(t, "namespace", te.Details["argument"])
+}
+
+func TestAnalyzeRBACEscalationPaths_ServiceAccountWithNullNamespaceReturnsError(t *testing.T) {
+	ksServer := newRBACEscalationTestServer(t)
+	result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{
+		"subject_kind": "ServiceAccount",
+		"name":         "app",
+		"namespace":    nil,
+	}))
+	require.True(t, result.IsError)
+	te := parsePSSToolError(t, result)
+	require.Equal(t, ErrCodeInvalidArgument, te.Code)
+	require.Equal(t, "namespace", te.Details["argument"])
+}
+
+func TestAnalyzeRBACEscalationPaths_InvalidSubjectKindReturnsError(t *testing.T) {
+	ksServer := newRBACEscalationTestServer(t)
+	result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{
+		"subject_kind": "Robot",
+		"name":         "app",
+	}))
+	require.True(t, result.IsError)
+	te := parsePSSToolError(t, result)
+	require.Equal(t, ErrCodeInvalidArgument, te.Code)
+	require.Equal(t, "subject_kind", te.Details["argument"])
+}
+
+func TestAnalyzeRBACEscalationPaths_UserSubjectNeedsNoNamespace(t *testing.T) {
+	target := unstructuredServiceAccount("prod", "target")
+	impersonator := unstructuredClusterRole("impersonator", unstructuredPolicyRule([]string{""}, []string{"serviceaccounts"}, []string{"impersonate"}, []string{"target"}))
+	crb := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "rbac.authorization.k8s.io/v1",
+		"kind":       "ClusterRoleBinding",
+		"metadata":   map[string]any{"name": "crb"},
+		"roleRef": map[string]any{
+			"apiGroup": "rbac.authorization.k8s.io",
+			"kind":     "ClusterRole",
+			"name":     "impersonator",
+		},
+		"subjects": []any{
+			map[string]any{"kind": "User", "name": "alice"},
+		},
+	}}
+	ksServer := newRBACEscalationTestServer(t, target, impersonator, crb)
+
+	result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{
+		"subject_kind": "User",
+		"name":         "alice",
+	}))
+	require.False(t, result.IsError)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(toolResultText(t, result)), &parsed))
+	require.Equal(t, "User alice", parsed["subject"])
+	require.Len(t, parsed["reached"].([]any), 1)
+}
+
+// A RoleBinding subject that names a ServiceAccount without a namespace is
+// resolved by the API server in the RoleBinding's namespace. The tool has to
+// follow such a binding, or it reports no escalation for an account that has one.
+func TestAnalyzeRBACEscalationPaths_UnqualifiedServiceAccountSubjectIsFollowed(t *testing.T) {
+	attackerSA := unstructuredServiceAccount("payments", "worker")
+	targetSA := unstructuredServiceAccount("payments", "target")
+	impersonator := unstructuredClusterRole("impersonator", unstructuredPolicyRule([]string{""}, []string{"serviceaccounts"}, []string{"impersonate"}, []string{"target"}))
+	rb := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "rbac.authorization.k8s.io/v1",
+		"kind":       "RoleBinding",
+		"metadata":   map[string]any{"name": "rb", "namespace": "payments"},
+		"roleRef": map[string]any{
+			"apiGroup": "rbac.authorization.k8s.io",
+			"kind":     "ClusterRole",
+			"name":     "impersonator",
+		},
+		"subjects": []any{
+			map[string]any{"kind": "ServiceAccount", "name": "worker"},
+		},
+	}}
+	ksServer := newRBACEscalationTestServer(t, attackerSA, targetSA, impersonator, rb)
+
+	result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{
+		"subject_kind": "ServiceAccount",
+		"namespace":    "payments",
+		"name":         "worker",
+	}))
+	require.False(t, result.IsError)
+
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(toolResultText(t, result)), &parsed))
+	reached := parsed["reached"].([]any)
+	require.Len(t, reached, 1)
+	require.Equal(t, "ServiceAccount payments/target", reached[0].(map[string]any)["subject"])
+}
+
+func TestAnalyzeRBACEscalationPaths_ListFailureIsClassified(t *testing.T) {
+	resources := []struct {
+		name string
+		gvr  schema.GroupVersionResource
+	}{
+		{"roles", roleGVR},
+		{"clusterroles", clusterRoleGVR},
+		{"rolebindings", roleBindingGVR},
+		{"clusterrolebindings", clusterRoleBindingGVR},
+		{"serviceaccounts", serviceAccountGVR},
+	}
+	causes := []struct {
+		name string
+		err  func(schema.GroupVersionResource) error
+		want ErrorCode
+	}{
+		{"forbidden", func(gvr schema.GroupVersionResource) error {
+			return apierrors.NewForbidden(gvr.GroupResource(), "", errors.New("denied"))
+		}, ErrCodeRBACDenied},
+		{"context canceled", func(schema.GroupVersionResource) error { return context.Canceled }, ErrCodeTimeout},
+		{"deadline exceeded", func(schema.GroupVersionResource) error { return context.DeadlineExceeded }, ErrCodeTimeout},
+		{"api server error", func(gvr schema.GroupVersionResource) error {
+			return apierrors.NewInternalError(errors.New("boom"))
+		}, ErrCodeK8sClientError},
+		{"generic error", func(schema.GroupVersionResource) error { return errors.New("connection refused") }, ErrCodeScanFailed},
+	}
+
+	for _, res := range resources {
+		for _, cause := range causes {
+			t.Run(res.name+"/"+cause.name, func(t *testing.T) {
+				ksServer := newRBACEscalationTestServer(t)
+				dyn := ksServer.k8sClient.DynamicClient.(*dynamicfake.FakeDynamicClient)
+				listErr := cause.err(res.gvr)
+				dyn.PrependReactor("list", res.name, func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, listErr
+				})
+
+				result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{
+					"subject_kind": "ServiceAccount",
+					"namespace":    "prod",
+					"name":         "app",
+				}))
+
+				te := toolErrorOf(t, result)
+				require.Equal(t, cause.want, te.Code)
+				require.Contains(t, te.Message, res.name, "message should name the resource that failed")
+				require.Contains(t, te.Message, listErr.Error(), "message should keep the underlying error")
+			})
+		}
+	}
+}
+
+func TestListRBACResources_PreservesErrorIdentity(t *testing.T) {
+	ksServer := newRBACEscalationTestServer(t)
+	dyn := ksServer.k8sClient.DynamicClient.(*dynamicfake.FakeDynamicClient)
+	dyn.PrependReactor("list", "rolebindings", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(roleBindingGVR.GroupResource(), "", errors.New("denied"))
+	})
+
+	_, err := listRBACResources(context.Background(), dyn)
+	require.Error(t, err)
+	require.True(t, apierrors.IsForbidden(err), "wrapping must keep the Forbidden status reachable: %v", err)
+	require.Equal(t, ErrCodeRBACDenied, classifyScanError(err))
+	require.NotEmpty(t, fmt.Sprint(err))
+}
+
+func TestAnalyzeRBACEscalationPaths_UnboundRewriteDoesNotConfirmAdmin(t *testing.T) {
+	editor := unstructuredClusterRole("editor", unstructuredPolicyRule([]string{"rbac.authorization.k8s.io"}, []string{"clusterroles"}, []string{"escalate", "patch"}, []string{"editable"}))
+	editable := unstructuredClusterRole("editable")
+	ksServer := newRBACEscalationTestServer(t, editor, editable, unstructuredClusterRoleBinding("editor", "editor", "dev", "attacker"))
+	result := registeredToolResult(t, dispatchRegisteredTool(t, ksServer, "analyze_rbac_escalation_paths", map[string]any{"subject_kind": "ServiceAccount", "namespace": "dev", "name": "attacker"}))
+	require.False(t, result.IsError)
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal([]byte(toolResultText(t, result)), &parsed))
+	require.Equal(t, false, parsed["cluster_admin_equivalent"])
+	findings := parsed["unbounded_findings"].([]any)
+	require.Len(t, findings, 1)
+	require.Equal(t, true, findings[0].(map[string]any)["permissions_unconfirmed"])
+	require.Empty(t, parsed["reached"])
+}

@@ -1,0 +1,333 @@
+package rbacgraph
+
+import (
+	"slices"
+	"strings"
+
+	rbacv1 "k8s.io/api/rbac/v1"
+)
+
+// EscalationResult is the outcome of computing every RBAC escalation
+// technique reachable from a starting Subject.
+type EscalationResult struct {
+	Start Subject
+	// Reached lists every other concrete identity Start can assume, each
+	// with the (shortest, breadth-first) chain of edges that reaches it.
+	// Truncated as soon as ClusterAdmin is confirmed true (see that
+	// field's doc comment) -- it is not a complete enumeration in that
+	// case, since every further reach is implied and not worth the noise.
+	Reached []EscalationPath
+	// Unbounded lists every distinct escalation edge encountered anywhere
+	// in the closure with permissions or possible targets that cannot be fully
+	// enumerated, together with the subject that holds
+	// it -- deduplicated by (subject, primitive, scope, detail), since the
+	// same grant can otherwise be rediscovered on more than one BFS pass over
+	// the same subject. This is a report of *why*, not a dead end: a
+	// namespace-scoped permission grant is also materialized into that subject's
+	// own rule set (as a wildcard rule confined to the finding's Scope) and the
+	// subject is re-queued, so anything it unlocks is still chased by the
+	// traversal -- see the e.Unbounded case below. ScopeUnknown findings
+	// retain uncertainty about missing named Roles without granting any
+	// permissions or proving cluster-admin. Unbounded User/ServiceAccount
+	// impersonation likewise retains the warning without inventing permissions.
+	Unbounded []UnboundedFinding
+	// Granted lists every finite rule grant -- a bind-verb or escalate-verb
+	// edge whose GrantedRules were adopted -- together with the subject that
+	// adopted it, deduplicated by (subject, primitive, scope, detail) and
+	// sorted by that key. It is the provenance of the rules EffectiveRules
+	// holds beyond the direct rules of the subject that adopted them: a
+	// grant leaves Reached, Unbounded and ClusterAdmin untouched, so without
+	// this the closure would show rules appearing from nowhere. A
+	// namespace-scoped Unbounded finding is not repeated here; it is already
+	// in Unbounded, and the wildcard rule it materializes is explained by it.
+	// Like EffectiveRules, it is not a complete enumeration once ClusterAdmin
+	// is confirmed.
+	Granted []GrantedFinding
+	// EffectiveRules is the union of every ScopedRule reachable: Start's
+	// own direct rules, every rule granted via bind-verb/escalate-verb
+	// (including transitively, when a granted Role/ClusterRole itself
+	// grants further escalation), and every rule directly held by each
+	// identity in Reached. Also truncated once ClusterAdmin is confirmed.
+	EffectiveRules []ScopedRule
+	// ClusterAdmin is true when EffectiveRules includes a cluster-wide
+	// */*/* rule, an Unbounded finding covers the whole cluster
+	// (Scope == "" and !ScopeUnknown and !PermissionsUnconfirmed, excluding User/ServiceAccount target
+	// enumeration warnings), or a superuser group (system:masters)
+	// was reached via impersonation -- however it was actually reached. Once true, the BFS
+	// stops expanding further: cluster-admin-equivalent power already
+	// implies every other identity and permission is reachable, so
+	// continuing would only enumerate implied consequences (e.g. every
+	// ServiceAccount in the cluster, since cluster-admin can always
+	// assign-serviceaccount to any of them) rather than surface anything
+	// new -- Reached/EffectiveRules reflect whatever had already been
+	// discovered at the point this became true, not a complete picture.
+	// This early stop is always sound: the verdict it produces is never
+	// wrong, only arrived at before every consequence was enumerated.
+	ClusterAdmin bool
+	// Truncated is true when the search hit maxEscalationHops with
+	// ClusterAdmin still false and work still queued -- meaning this
+	// result may be an incomplete negative, not a confirmed one. This is
+	// the failure mode that actually matters: unlike the ClusterAdmin
+	// early-stop (always a sound true), running out of budget without
+	// reaching a verdict means a real escalation path may exist beyond
+	// what was explored. Distinguish this from a genuine "nothing found"
+	// before treating ClusterAdmin == false as a clean bill of health.
+	Truncated bool
+}
+
+// UnboundedFinding records that Subject holds an unrestricted escalation
+// primitive whose targets this package cannot enumerate from collected
+// cluster objects (e.g. impersonate on users with no resourceNames
+// restriction, or escalate+update on clusterroles cluster-wide). A
+// ScopeUnknown edge instead warns about a missing named Role with no
+// resolved namespace; it does not confirm authority in any scope.
+type UnboundedFinding struct {
+	Subject Subject
+	Edge    EscalationEdge
+}
+
+// GrantedFinding records that Subject adopted the finite rule set an
+// escalate-verb or bind-verb edge grants. Subject is Start for a grant its
+// own rules unlock, or an identity in Reached when that identity's rules
+// unlocked it; either way its GrantedRules are part of EffectiveRules.
+type GrantedFinding struct {
+	Subject Subject
+	Edge    EscalationEdge
+}
+
+// grantKey identifies one grant an escalate-verb or bind-verb edge gives a
+// subject. Rewrite grants use their target and scope, not a binding-path
+// explanation that can change as permissions grow. Scope is part of the
+// identity and is not left to Detail to carry:
+// Detail is prose for a reader, and two edges that differ only in the
+// namespace they apply to (the same unrestricted grant reaching two
+// namespaces) share it word for word.
+type grantKey struct {
+	primitive EscalationPrimitive
+	scope     string
+	detail    string
+	target    RoleTarget
+}
+
+func grantKeyOf(e EscalationEdge) grantKey {
+	key := grantKey{primitive: e.Primitive, scope: e.Scope, detail: e.Detail}
+	if e.Primitive == PrimitiveBindVerb && e.Target != nil {
+		// Likewise, adopting the bound role's rules is one grant however many
+		// bindings can carry it.
+		key.target = *e.Target
+		key.detail = "adopted bound role"
+	}
+	if e.Primitive == PrimitiveEscalateVerb && e.Target != nil {
+		// The same rewrite may gain another binding path after rules grow.
+		// That changes its explanation, not the acquired permission or target.
+		key.target = *e.Target
+		key.detail = "acquired rewritten role"
+		if e.PermissionsUnconfirmed {
+			key.detail = "unconfirmed role rewrite"
+		}
+	}
+	return key
+}
+
+// unboundedKey identifies one UnboundedFinding: a grant and who holds it.
+type unboundedKey struct {
+	subject Subject
+	grant   grantKey
+}
+
+// maxEscalationHops bounds the BFS worklist: subjects dequeued and
+// processed, not raw hop-count. Deliberately generous -- a single
+// cluster-wide "create pods" grant alone enqueues every ServiceAccount in
+// the cluster (routine on any cluster with hundreds of Service Accounts
+// across an ingress/operator stack), so a tight bound here risks exactly
+// the false-negative failure mode this package exists to avoid: a result
+// that looks like a clean negative because the search ran out of budget,
+// not because there was nothing to find. See EscalationResult.Truncated.
+var maxEscalationHops = 20000 // var, not const: tests override this to exercise Truncated without building a 20000-object fixture.
+
+// AnalyzeEscalation computes every privilege-escalation technique reachable
+// from start via breadth-first search: assuming another concrete identity
+// (impersonate, assign-serviceaccount, mint-serviceaccount-token) queues
+// that identity for its own escalation edges to be explored in turn;
+// adopting a Role/ClusterRole's rules (bind-verb, escalate-verb) enriches
+// the current subject's own rule set and re-queues it, so a rule gained
+// that way which itself unlocks further escalation (e.g. a bound
+// ClusterRole that grants impersonate) is chased, not just recorded.
+// Reprocessing a subject happens only when a bind/escalate edge actually
+// grants something new (tracked per-subject by grantKey, which is unique per
+// distinct Role/ClusterRole+scope grant), so this always terminates even though maxEscalationHops bounds it too.
+// Reaching a hardcoded superuser identity (system:masters) via
+// impersonation, or confirming cluster-admin-equivalent power any other
+// way, stops the search early -- see EscalationResult.ClusterAdmin and
+// EscalationResult.Truncated for what that does and doesn't mean.
+func (idx *Index) AnalyzeEscalation(start Subject) EscalationResult {
+	subjectRules := map[Subject][]ScopedRule{start: idx.DirectRules(start)}
+	grantedSeen := map[Subject]map[grantKey]bool{start: {}}
+	unboundedSeen := map[unboundedKey]bool{}
+	pathTo := map[Subject][]EscalationEdge{}
+	visited := map[Subject]bool{start: true}
+	var order []Subject
+	var unbounded []UnboundedFinding
+	var granted []GrantedFinding
+	clusterAdmin := IsClusterAdminEquivalent(subjectRules[start]) || superuserGroups[start.Name] && start.Kind == KindGroup
+
+	var rewrites []roleRewrite
+	rewriteSeen := map[RoleTarget]bool{}
+	worklist := []Subject{start}
+	truncated := false
+	for i := 0; len(worklist) > 0 && !clusterAdmin; i++ {
+		if i >= maxEscalationHops {
+			truncated = true
+			break
+		}
+		s := worklist[0]
+		worklist = worklist[1:]
+
+		// A rewrite can benefit identities reached before or after its owner.
+		// Revisit known identities only when a genuinely new target is learned.
+		learnedRewrite := false
+		for _, edge := range idx.escalateVerbEdges(subjectRules[s]) {
+			if edge.Target == nil || rewriteSeen[*edge.Target] {
+				continue
+			}
+			rewriteSeen[*edge.Target] = true
+			rewrites = append(rewrites, roleRewrite{subject: s, edge: edge})
+			learnedRewrite = true
+		}
+		if learnedRewrite {
+			for _, known := range append([]Subject{start}, order...) {
+				if known != s && !slices.Contains(worklist, known) {
+					worklist = append(worklist, known)
+				}
+			}
+		}
+		edges := idx.directEscalationEdges(s, subjectRules[s], rewrites)
+		grew := false
+		for _, e := range edges {
+			switch {
+			case e.ToSubject != nil:
+				t := *e.ToSubject
+				if t.Kind == KindGroup && superuserGroups[t.Name] {
+					clusterAdmin = true
+					pathTo[t] = append(append([]EscalationEdge{}, pathTo[s]...), e)
+					if !visited[t] {
+						visited[t] = true
+						order = append(order, t)
+					}
+					break
+				}
+				if visited[t] {
+					continue
+				}
+				visited[t] = true
+				order = append(order, t)
+				pathTo[t] = append(append([]EscalationEdge{}, pathTo[s]...), e)
+				subjectRules[t] = idx.DirectRules(t)
+				grantedSeen[t] = map[grantKey]bool{}
+				worklist = append(worklist, t)
+			case e.Unbounded:
+				key := unboundedKey{subject: s, grant: grantKeyOf(e)}
+				if !unboundedSeen[key] {
+					unboundedSeen[key] = true
+					unbounded = append(unbounded, UnboundedFinding{Subject: s, Edge: e})
+				}
+				if e.Primitive == PrimitiveImpersonate &&
+					(e.ImpersonatedKind == KindUser || e.ImpersonatedKind == KindServiceAccount) {
+					// The target set is unbounded, not its permissions. Concrete
+					// identities are followed through ToSubject edges; uncollected
+					// identities remain a risk finding without granting wildcard rules.
+					continue
+				}
+				if e.ScopeUnknown || e.PermissionsUnconfirmed {
+					continue // report uncertainty, never synthesize permissions from it
+				}
+				if e.Scope == "" {
+					clusterAdmin = true
+					break
+				}
+				// A namespace-scoped Unbounded finding proves s can grant
+				// itself arbitrary permissions within e.Scope (e.g.
+				// escalate+update on a Role restricted to that namespace).
+				// That is itself a rule s now effectively holds -- materialize
+				// it as a wildcard rule scoped to e.Scope and re-queue s, the
+				// same way a bind/escalate edge's GrantedRules do, so
+				// whatever it unlocks (e.g. gaining create-pods within
+				// e.Scope, then assign-serviceaccount to a privileged SA in
+				// that namespace) is chased rather than treated as a dead
+				// end. Without this, a scoped Unbounded finding was recorded
+				// but never fed back into the traversal, silently missing
+				// real multi-hop paths.
+				if !grantedSeen[s][key.grant] {
+					grantedSeen[s][key.grant] = true
+					subjectRules[s] = append(subjectRules[s], ScopedRule{
+						Rule:      rbacv1.PolicyRule{APIGroups: []string{"*"}, Resources: []string{"*"}, Verbs: []string{"*"}},
+						Namespace: e.Scope,
+					})
+					grew = true
+				}
+			default:
+				grant := grantKeyOf(e)
+				if grantedSeen[s][grant] {
+					continue
+				}
+				grantedSeen[s][grant] = true
+				subjectRules[s] = append(subjectRules[s], e.GrantedRules...)
+				granted = append(granted, GrantedFinding{Subject: s, Edge: e})
+				grew = true
+			}
+			if clusterAdmin {
+				break
+			}
+		}
+		if grew && !clusterAdmin {
+			if IsClusterAdminEquivalent(subjectRules[s]) {
+				clusterAdmin = true
+			} else {
+				worklist = append(worklist, s)
+			}
+		}
+	}
+
+	allRules := append([]ScopedRule{}, subjectRules[start]...)
+	var reached []EscalationPath
+	for _, s := range order {
+		allRules = append(allRules, subjectRules[s]...)
+		reached = append(reached, EscalationPath{From: start, Edges: pathTo[s]})
+	}
+
+	if !clusterAdmin {
+		clusterAdmin = IsClusterAdminEquivalent(allRules)
+	}
+	if clusterAdmin {
+		truncated = false
+	}
+
+	return EscalationResult{
+		Start:          start,
+		Reached:        reached,
+		Unbounded:      unbounded,
+		Granted:        sortGranted(granted),
+		EffectiveRules: allRules,
+		ClusterAdmin:   clusterAdmin,
+		Truncated:      truncated,
+	}
+}
+
+// sortGranted orders findings by subject, then primitive, scope and detail --
+// the same identity grantKey deduplicates on -- so the result does not depend
+// on the order the traversal happened to discover them in.
+func sortGranted(granted []GrantedFinding) []GrantedFinding {
+	slices.SortStableFunc(granted, func(a, b GrantedFinding) int {
+		if c := strings.Compare(a.Subject.String(), b.Subject.String()); c != 0 {
+			return c
+		}
+		if c := strings.Compare(string(a.Edge.Primitive), string(b.Edge.Primitive)); c != 0 {
+			return c
+		}
+		if c := strings.Compare(a.Edge.Scope, b.Edge.Scope); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Edge.Detail, b.Edge.Detail)
+	})
+	return granted
+}

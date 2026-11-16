@@ -1,0 +1,434 @@
+package core
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
+
+	"github.com/kubescape/go-logger"
+	"github.com/kubescape/go-logger/helpers"
+	"github.com/kubescape/kubescape/v4/core/cautils"
+	"github.com/kubescape/kubescape/v4/core/cautils/getter"
+	metav1 "github.com/kubescape/kubescape/v4/core/meta/datastructures/v1"
+	"github.com/kubescape/opa-utils/reporthandling"
+)
+
+const (
+	TargetControlsInputs = "controls-inputs"
+	TargetExceptions     = "exceptions"
+	TargetControl        = "control"
+	TargetFramework      = "framework"
+	TargetArtifacts      = "artifacts"
+	TargetAttackTracks   = "attack-tracks"
+
+	// downloadDirPerm matches the 0700 policy customerloader.go's
+	// updateConfigFile() already enforces (and re-tightens with chmod) on
+	// ~/.kubescape: setPathAndFilename() defaults downloadInfo.Path to that
+	// same directory (getter.GetDefaultPath("")) when no --output path is
+	// given, and it holds config.json's AccessKey. A more permissive mode
+	// here would race the config loader's own hardening and could leave the
+	// directory group-readable depending on which one runs first.
+	downloadDirPerm = 0700
+)
+
+var downloadFunc = map[string]func(context.Context, *metav1.DownloadInfo) ([]string, error){
+	TargetControlsInputs: downloadConfigInputs,
+	TargetExceptions:     downloadExceptions,
+	TargetControl:        downloadControl,
+	TargetFramework:      downloadFramework,
+	TargetArtifacts:      downloadArtifacts,
+	TargetAttackTracks:   downloadAttackTracks,
+}
+
+// Indirection seams used only by the download* functions in this file: by
+// default they are the real getter constructors from initutils.go,
+// cautils.GetTenantConfig, and getKubernetesApi, which (with no local file,
+// no account configured, and/or a reachable cluster) ultimately reach the
+// network - GitHub releases, the Kubescape Cloud API, or the Kubernetes API
+// server. kubernetesAPIFunc in particular must be stubbed together with
+// tenantConfigFunc: it is evaluated eagerly as an argument to
+// tenantConfigFunc, so leaving it real still probes the cluster (discovery's
+// ServerPreferredResources call) even when tenantConfigFunc itself is faked.
+// Tests substitute fakes here to exercise every branch of the download*
+// functions without a network or cluster dependency.
+//
+// policyGetterFunc and exceptionsGetterFunc are also called directly (not
+// through these vars) from list.go and scan.go, so swapping them here has no
+// effect on those call sites.
+var (
+	policyGetterFunc       = getPolicyGetter
+	exceptionsGetterFunc   = getExceptionsGetter
+	attackTracksGetterFunc = getAttackTracksGetter
+	configInputsGetterFunc = getConfigInputsGetter
+	tenantConfigFunc       = cautils.GetTenantConfig
+	kubernetesAPIFunc      = getKubernetesApi
+)
+
+func DownloadSupportCommands() []string {
+	commands := []string{}
+	for key := range downloadFunc {
+		commands = append(commands, key)
+	}
+
+	// Sort the keys of the map
+	sort.Strings(commands)
+	return commands
+}
+
+func (ks *Kubescape) Download(downloadInfo *metav1.DownloadInfo) (*metav1.DownloadResult, error) {
+	if downloadInfo == nil {
+		return nil, errors.New("uninitialized download parameters")
+	}
+
+	setPathAndFilename(downloadInfo)
+	if err := os.MkdirAll(downloadInfo.Path, downloadDirPerm); err != nil {
+		return nil, fmt.Errorf("failed to create download directory %q: %w", downloadInfo.Path, err)
+	}
+	files, err := downloadArtifact(ks.Context(), downloadInfo, downloadFunc)
+	if err != nil {
+		return nil, err
+	}
+	return &metav1.DownloadResult{Files: files}, nil
+}
+
+func downloadArtifact(ctx context.Context, downloadInfo *metav1.DownloadInfo, downloadArtifactFunc map[string]func(context.Context, *metav1.DownloadInfo) ([]string, error)) ([]string, error) {
+	if f, ok := downloadArtifactFunc[downloadInfo.Target]; ok {
+		files, err := f(ctx, downloadInfo)
+		if err != nil {
+			return nil, err
+		}
+		return files, nil
+	}
+	return nil, fmt.Errorf("unknown command to download")
+}
+
+func setPathAndFilename(downloadInfo *metav1.DownloadInfo) {
+	// The CLI (cmd/download/download.go) pre-splits a "--output <file>.json"
+	// into (dir, file): a bare "nsa.json" arrives here as Path="" +
+	// FileName="nsa.json". A FileName set with an empty Path means "current
+	// directory", not "no output path given" — defaulting it to ~/.kubescape
+	// would silently discard the user's --output file.
+	if downloadInfo.FileName != "" {
+		if downloadInfo.Path == "" {
+			downloadInfo.Path = "."
+		} else {
+			downloadInfo.Path = filepath.Clean(downloadInfo.Path)
+		}
+		return
+	}
+
+	if downloadInfo.Path == "" {
+		downloadInfo.Path = getter.GetDefaultPath("")
+		return
+	}
+
+	dir, file := filepath.Split(downloadInfo.Path)
+	if dir == "" && file != "." && file != ".." && strings.EqualFold(filepath.Ext(file), ".json") {
+		// Bare .json file name (e.g. "nsa.json" passed straight to the API):
+		// save it to the current directory instead of misreading it as a
+		// directory. Non-.json bare names keep their directory behavior, since
+		// download artifacts are always .json files.
+		downloadInfo.FileName = file
+		downloadInfo.Path = "."
+		return
+	}
+	if dir == "" {
+		// Extension-less bare name: keep treating it as a directory.
+		downloadInfo.Path = file
+		return
+	}
+	// Intentionally restricted to ".json": an existing TestSetPathAndFilename
+	// case enshrines .txt-in-dir-as-directory behavior. The extension check is
+	// case-insensitive, so only a real .json extension (such as NSA.JSON) is a
+	// file; report.JSON.bak and report.JSONL stay directories. The lowercase
+	// substring check keeps the legacy classification of names such as
+	// report.json.bak.
+	if strings.EqualFold(filepath.Ext(file), ".json") || strings.Contains(file, ".json") {
+		downloadInfo.Path = filepath.Clean(dir)
+		downloadInfo.FileName = file
+	} else {
+		downloadInfo.Path = filepath.Clean(downloadInfo.Path)
+	}
+}
+
+func downloadArtifacts(ctx context.Context, downloadInfo *metav1.DownloadInfo) ([]string, error) {
+	downloadInfo.FileName = ""
+	var artifacts = map[string]func(context.Context, *metav1.DownloadInfo) ([]string, error){
+		TargetControlsInputs: downloadConfigInputs,
+		TargetExceptions:     downloadExceptions,
+		TargetFramework:      downloadFramework,
+		TargetAttackTracks:   downloadAttackTracks,
+	}
+	var files []string
+	var errs []error
+	for artifact := range artifacts {
+		artifactFiles, err := downloadArtifact(ctx, &metav1.DownloadInfo{
+			Target:    artifact,
+			Path:      downloadInfo.Path,
+			FileName:  fmt.Sprintf("%s.json", artifact),
+			AccountID: downloadInfo.AccountID,
+			AccessKey: downloadInfo.AccessKey,
+		}, artifacts)
+		if err != nil {
+			logger.L().Ctx(ctx).Warning("error downloading", helpers.String("artifact", artifact), helpers.Error(err))
+			errs = append(errs, err)
+			continue
+		}
+		files = append(files, artifactFiles...)
+	}
+	return files, errors.Join(errs...)
+}
+
+func downloadConfigInputs(ctx context.Context, downloadInfo *metav1.DownloadInfo) ([]string, error) {
+	tenant := tenantConfigFunc(ctx, downloadInfo.AccountID, downloadInfo.AccessKey, "", "", kubernetesAPIFunc())
+
+	controlsInputsGetter, _, err := configInputsGetterFunc(ctx, downloadInfo.Identifier, tenant.GetAccountID(), nil, false, false)
+	if err != nil {
+		return nil, err
+	}
+	controlInputs, err := controlsInputsGetter.GetControlsInputs(ctx, tenant.GetContextName())
+	if err != nil {
+		return nil, err
+	}
+	if downloadInfo.FileName == "" {
+		downloadInfo.FileName = fmt.Sprintf("%s.json", downloadInfo.Target)
+	}
+	if controlInputs == nil {
+		return nil, fmt.Errorf("failed to download controlInputs - received empty objects")
+	}
+	// save in file
+	downloadTo := filepath.Join(downloadInfo.Path, downloadInfo.FileName)
+	err = getter.SaveInFile(controlInputs, downloadTo)
+	if err != nil {
+		return nil, err
+	}
+	logger.L().Success("Downloaded", helpers.String("artifact", downloadInfo.Target), helpers.String("path", downloadTo))
+	return []string{downloadTo}, nil
+}
+
+func downloadExceptions(ctx context.Context, downloadInfo *metav1.DownloadInfo) ([]string, error) {
+	tenant := tenantConfigFunc(ctx, downloadInfo.AccountID, downloadInfo.AccessKey, "", "", kubernetesAPIFunc())
+	// The downloaded file serves any later scan, so it must not carry the
+	// SecurityException CRDs of the cluster the kube-context points at today.
+	exceptionsGetter, _, err := exceptionsGetterFunc(ctx, "", tenant.GetAccountID(), nil, false, false)
+	if err != nil {
+		return nil, err
+	}
+
+	exceptions, err := exceptionsGetter.GetExceptions(ctx, tenant.GetContextName())
+	if err != nil {
+		return nil, err
+	}
+
+	if downloadInfo.FileName == "" {
+		downloadInfo.FileName = fmt.Sprintf("%s.json", downloadInfo.Target)
+	}
+	// save in file
+	downloadTo := filepath.Join(downloadInfo.Path, downloadInfo.FileName)
+	err = getter.SaveInFile(exceptions, downloadTo)
+	if err != nil {
+		return nil, err
+	}
+	logger.L().Ctx(ctx).Success("Downloaded", helpers.String("artifact", downloadInfo.Target), helpers.String("path", downloadTo))
+	return []string{downloadTo}, nil
+}
+
+func downloadAttackTracks(ctx context.Context, downloadInfo *metav1.DownloadInfo) ([]string, error) {
+	var err error
+	tenant := tenantConfigFunc(ctx, downloadInfo.AccountID, downloadInfo.AccessKey, "", "", kubernetesAPIFunc())
+
+	attackTracksGetter, err := attackTracksGetterFunc(ctx, "", tenant.GetAccountID(), nil, false)
+	if err != nil {
+		return nil, err
+	}
+
+	attackTracks, err := attackTracksGetter.GetAttackTracks()
+	if err != nil {
+		return nil, err
+	}
+
+	if downloadInfo.FileName == "" {
+		downloadInfo.FileName = fmt.Sprintf("%s.json", downloadInfo.Target)
+	}
+	// save in file
+	downloadTo := filepath.Join(downloadInfo.Path, downloadInfo.FileName)
+	err = getter.SaveInFile(attackTracks, downloadTo)
+	if err != nil {
+		return nil, err
+	}
+	logger.L().Success("Downloaded", helpers.String("attack tracks", downloadInfo.Target), helpers.String("path", downloadTo))
+	return []string{downloadTo}, nil
+
+}
+
+func downloadFramework(ctx context.Context, downloadInfo *metav1.DownloadInfo) ([]string, error) {
+
+	tenant := tenantConfigFunc(ctx, downloadInfo.AccountID, downloadInfo.AccessKey, "", "", kubernetesAPIFunc())
+
+	g, err := policyGetterFunc(ctx, nil, tenant.GetAccountID(), true, nil, false)
+	if err != nil {
+		return nil, err
+	}
+
+	if downloadInfo.Identifier == "" {
+		// if framework name not specified - download all frameworks
+		frameworks, err := g.GetFrameworks()
+		if err != nil {
+			return nil, err
+		}
+		frameworks, err = appendSecurityViewFrameworks(securityViewFrameworksGetter(g), frameworks)
+		if err != nil {
+			return nil, err
+		}
+		var files []string
+		for _, fw := range frameworks {
+			filename, err := getter.PolicyCacheFilename(fw.Name)
+			if err != nil {
+				logger.L().Ctx(ctx).Warning("skipping framework with empty name", helpers.Error(err))
+				continue
+			}
+			downloadTo := filepath.Join(downloadInfo.Path, filename)
+			err = getter.SaveInFile(fw, downloadTo)
+			if err != nil {
+				return nil, err
+			}
+			logger.L().Success("Downloaded", helpers.String("artifact", downloadInfo.Target), helpers.String("name", fw.Name), helpers.String("path", downloadTo))
+			files = append(files, downloadTo)
+		}
+		return files, nil
+	}
+
+	if downloadInfo.FileName == "" {
+		filename, err := getter.PolicyCacheFilename(downloadInfo.Identifier)
+		if err != nil {
+			return nil, err
+		}
+		downloadInfo.FileName = filename
+	}
+	framework, err := g.GetFramework(downloadInfo.Identifier)
+	if err != nil {
+		return nil, err
+	}
+	if framework == nil {
+		return nil, fmt.Errorf("failed to download framework - received empty objects")
+	}
+	downloadTo := filepath.Join(downloadInfo.Path, downloadInfo.FileName)
+	err = getter.SaveInFile(framework, downloadTo)
+	if err != nil {
+		return nil, err
+	}
+	logger.L().Success("Downloaded", helpers.String("artifact", downloadInfo.Target), helpers.String("name", framework.Name), helpers.String("path", downloadTo))
+	return []string{downloadTo}, nil
+}
+
+// appendSecurityViewFrameworks adds the frameworks the default `kubescape scan`
+// evaluates to a "download all" result. GetFrameworks lists compliance
+// frameworks only, so without this an offline bundle cannot serve the scan it
+// is documented for: `kubescape scan --use-artifacts-from <dir>` asks for
+// workloadscan or clusterscan and finds neither. A getter that already listed
+// one is not asked for it again.
+func appendSecurityViewFrameworks(g getter.IPolicyGetter, frameworks []reporthandling.Framework) ([]reporthandling.Framework, error) {
+	for _, name := range getter.SecurityViewFrameworks {
+		if slices.ContainsFunc(frameworks, func(fw reporthandling.Framework) bool { return strings.EqualFold(fw.Name, name) }) {
+			continue
+		}
+		framework, err := g.GetFramework(name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to download framework '%s': %w", name, err)
+		}
+		if framework == nil {
+			return nil, fmt.Errorf("failed to download framework '%s' - received empty objects", name)
+		}
+		frameworks = append(frameworks, *framework)
+	}
+	return frameworks, nil
+}
+
+// securityViewFrameworksGetter returns the getter a "download all" asks for the
+// security view frameworks. A release answers for them by name, so it is used as
+// is. The cache that getDownloadReleasedPolicy falls back to when a release
+// cannot be fetched is a LoadPolicy over the NativeFrameworks files, and a
+// LoadPolicy looks nowhere but its own paths, so there the two files are read
+// from the same cache through a loader of their own. A file that is missing
+// stays a hard error. NativeFrameworks is left alone because it also decides
+// what a compliance scan of all frameworks evaluates.
+func securityViewFrameworksGetter(g getter.IPolicyGetter) getter.IPolicyGetter {
+	if _, ok := g.(*getter.LoadPolicy); !ok {
+		return g
+	}
+	fwPaths := make([]string, 0, len(getter.SecurityViewFrameworks))
+	for _, name := range getter.SecurityViewFrameworks {
+		fwPaths = append(fwPaths, getter.GetDefaultPath(name+".json"))
+	}
+	return getter.NewLoadPolicy(fwPaths)
+}
+
+func downloadControl(ctx context.Context, downloadInfo *metav1.DownloadInfo) ([]string, error) {
+
+	tenant := tenantConfigFunc(ctx, downloadInfo.AccountID, downloadInfo.AccessKey, "", "", kubernetesAPIFunc())
+
+	g, err := policyGetterFunc(ctx, nil, tenant.GetAccountID(), false, nil, false)
+	if err != nil {
+		return nil, err
+	}
+
+	if downloadInfo.Identifier == "" {
+		// if control ID not specified - download all controls
+		controls, err := g.ListControls()
+		if err != nil {
+			return nil, err
+		}
+		var files []string
+		for _, listEntry := range controls {
+			controlID := strings.Split(listEntry, "|")[0]
+			control, err := g.GetControl(controlID)
+			if err != nil {
+				logger.L().Ctx(ctx).Warning("failed to download control", helpers.String("ID", controlID), helpers.Error(err))
+				continue
+			}
+			if control == nil {
+				logger.L().Ctx(ctx).Warning("failed to download control - received empty objects", helpers.String("ID", controlID))
+				continue
+			}
+			filename, err := getter.PolicyCacheFilename(controlID)
+			if err != nil {
+				logger.L().Ctx(ctx).Warning("skipping control with invalid ID", helpers.String("ID", controlID), helpers.Error(err))
+				continue
+			}
+			downloadTo := filepath.Join(downloadInfo.Path, filename)
+			err = getter.SaveInFile(control, downloadTo)
+			if err != nil {
+				return nil, err
+			}
+			logger.L().Success("Downloaded", helpers.String("artifact", downloadInfo.Target), helpers.String("ID", controlID), helpers.String("path", downloadTo))
+			files = append(files, downloadTo)
+		}
+		return files, nil
+	}
+	if downloadInfo.FileName == "" {
+		filename, err := getter.PolicyCacheFilename(downloadInfo.Identifier)
+		if err != nil {
+			return nil, err
+		}
+		downloadInfo.FileName = filename
+	}
+	controls, err := g.GetControl(downloadInfo.Identifier)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download control ID '%s': %w", downloadInfo.Identifier, err)
+	}
+	if controls == nil {
+		return nil, fmt.Errorf("failed to download control id '%s' - received empty objects", downloadInfo.Identifier)
+	}
+	downloadTo := filepath.Join(downloadInfo.Path, downloadInfo.FileName)
+	err = getter.SaveInFile(controls, downloadTo)
+	if err != nil {
+		return nil, err
+	}
+	logger.L().Success("Downloaded", helpers.String("artifact", downloadInfo.Target), helpers.String("ID", downloadInfo.Identifier), helpers.String("path", downloadTo))
+	return []string{downloadTo}, nil
+}
