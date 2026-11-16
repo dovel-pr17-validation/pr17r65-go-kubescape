@@ -55,7 +55,7 @@ require (
 	github.com/jwalton/gchalk v1.3.0
 	github.com/klauspost/compress v1.20.2
 	github.com/kubescape/backend v0.0.53
-	github.com/kubescape/go-git-url v0.0.33
+	github.com/kubescape/go-git-url v0.0.34
 	github.com/kubescape/go-logger v0.0.35
 	github.com/kubescape/k8s-interface v0.0.221
 	github.com/kubescape/opa-utils v0.0.318
