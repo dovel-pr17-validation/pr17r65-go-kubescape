@@ -116,7 +116,7 @@ require (
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/op/go-logging.v1 v1.0.0-20160211212156-b2cb9fa56473
 	gopkg.in/yaml.v3 v3.0.1
-	helm.sh/helm/v3 v3.21.4
+	helm.sh/helm/v3 v3.22.1
 	k8s.io/api v0.37.2
 	k8s.io/apimachinery v0.37.2
 	k8s.io/apiserver v0.37.2
@@ -637,12 +637,12 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gorm.io/gorm v1.31.1 // indirect
 	howett.net/plist v1.0.1 // indirect
-	k8s.io/apiextensions-apiserver v0.37.0 // indirect
-	k8s.io/cli-runtime v0.36.2 // indirect
+	k8s.io/apiextensions-apiserver v0.37.1 // indirect
+	k8s.io/cli-runtime v0.37.1 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/kms v0.37.2 // indirect
 	k8s.io/kube-openapi v0.0.0-20261001230523-97fa35140926 // indirect
-	k8s.io/kubectl v0.36.2 // indirect
+	k8s.io/kubectl v0.37.1 // indirect
 	k8s.io/streaming v0.37.2 // indirect
 	modernc.org/libc v1.79.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
