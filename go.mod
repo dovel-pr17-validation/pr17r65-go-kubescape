@@ -72,7 +72,7 @@ require (
 	github.com/mitchellh/copystructure v1.2.0
 	github.com/moby/buildkit v0.33.0
 	github.com/open-policy-agent/opa v1.22.0
-	github.com/openvex/go-vex v0.2.7
+	github.com/openvex/go-vex v0.2.9
 	github.com/owenrumney/go-sarif/v2 v2.3.3
 	github.com/package-url/packageurl-go v0.1.7
 	github.com/project-copacetic/copacetic v0.15.0
